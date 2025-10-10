@@ -1,4 +1,4 @@
-# AutoVantage: Real-Time Ball Sim over WebRTC + WebTransport
+# WAutoVantage: Real-Time visualization for autonomous vehicle scene understanding 
 
 ## Overview
 
