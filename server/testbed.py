@@ -465,17 +465,26 @@ class AVHMI(pyglet.window.Window):
         self.ego = Ego()
         car_obj_path = "assets/WAutoCar.obj"
         self.car_mesh: Optional[Mesh] = None
+        self.tex_normal = None
+        self.tex_brake = None
         try:
             tri_pos, tri_uv, tex_path = load_obj_with_uv_mtl(car_obj_path, scale= 1.0, center_y=0.0)
             if tri_uv and tex_path:
-                tex = create_texture_2d(tex_path)
-                if tex:
+                self.tex_normal = create_texture_2d(tex_path)
+                if self.tex_normal:
                     self.car_mesh = Mesh(
-                        tri_pos, None, tri_uv, tex.id, gl.GL_TRIANGLES,
+                        tri_pos, None, tri_uv, self.tex_normal.id, gl.GL_TRIANGLES,
                         mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw)),
-                        _tex_obj=tex,  # keep it alive
+                        _tex_obj=self.tex_normal,  # keep it alive
                     )
                     print(f"Loaded textured car: {len(tri_pos)//3} tris, tex='{tex_path}'")
+                base, ext = os.path.splitext(tex_path)
+                tex_brake_path = f"{base}_brake{ext}"
+                if os.path.isfile(tex_brake_path):
+                    self.tex_brake = create_texture_2d(tex_brake_path)
+                    print(f"Loaded brake light texture: {tex_brake_path}")
+                else:
+                    print("No _brake texture found, using default")
             if self.car_mesh is None:
                 # Fallback: flat color if no UV/texture
                 color = (0.12, 0.75, 0.90)
@@ -616,6 +625,7 @@ class AVHMI(pyglet.window.Window):
         throttle  = 1.0 if self.keys[key.W] else 0.0
         brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
         steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
+        self.brake_on = brake > 0.1
 
         self.ego.update(dt, throttle, steer_cmd, brake)
         for w in self.wheels:
@@ -651,13 +661,6 @@ class AVHMI(pyglet.window.Window):
         for ln in self.lanes:
             self.renderer.draw_mesh(ln, pv)
 
-        # # Draw car
-        # if self.car_mesh:
-        #     self.car_mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
-        #     self.renderer.draw_mesh(self.car_mesh, pv)
-        # else:
-        #     self.renderer.draw_mesh(self.ego.mesh, pv)
-
         # Car model matrix once
         car_T = mat4_translate(*self.ego.pos)
         car_R = mat4_rotate_y(self.ego.yaw)
@@ -666,7 +669,10 @@ class AVHMI(pyglet.window.Window):
         # Draw car
         if self.car_mesh:
             self.car_mesh.model = car_M
-            self.renderer.draw_mesh(self.car_mesh, pv)
+            active_tex = self.tex_brake if (self.brake_on and self.tex_brake) else self.tex_normal
+            if active_tex:
+                self.car_mesh.texture_id = active_tex.id
+                self.renderer.draw_mesh(self.car_mesh, pv)
         else:
             self.ego.mesh.model = car_M
             self.renderer.draw_mesh(self.ego.mesh, pv)
