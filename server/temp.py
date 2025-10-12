@@ -29,6 +29,21 @@ def parse_mtl_for_diffuse_texture(mtl_path: str) -> Optional[str]:
             tex = os.path.join(os.path.dirname(mtl_path), tex)
     return tex if os.path.isfile(tex) else None
 
+def make_grid_tile(size=40.0, step=2.0, color=(0.25, 0.25, 0.25)):
+    # Bounded square grid centered at origin
+    s = size * 0.5
+    verts, cols = [], []
+    v = -s
+    while v <= s + 1e-6:
+        # lines parallel to X
+        verts += [(-s, 0.0, v), (s, 0.0, v)]
+        cols  += [color,        color]
+        # lines parallel to Z
+        verts += [(v, 0.0, -s), (v, 0.0,  s)]
+        cols  += [color,        color]
+        v += step
+    return verts, cols
+
 # ------------------------------------------------------------
 # OBJ loader with UV + MTL (map_Kd). Falls back to color if no UV/texture.
 # ------------------------------------------------------------
@@ -264,7 +279,7 @@ class Mesh:
 
 class Ego:
     def __init__(self):
-        self.pos  = [0.0, 0.5, 0.0]
+        self.pos  = [0.0, 0.0, 0.0]
         self.yaw  = 0.0
         self.v    = 0.0
         self.length, self.width, self.height = 4.6, 1.9, 1.6
@@ -430,13 +445,14 @@ class AVHMI(pyglet.window.Window):
         self.push_handlers(self.keys)
         self.set_exclusive_mouse(False)
         self.mouse_captured = False
+        self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
 
         # Ego + car mesh
         self.ego = Ego()
         car_obj_path = "assets/WAutoCar.obj"
         self.car_mesh: Optional[Mesh] = None
         try:
-            tri_pos, tri_uv, tex_path = load_obj_with_uv_mtl(car_obj_path, scale=0.025, center_y=0.0)
+            tri_pos, tri_uv, tex_path = load_obj_with_uv_mtl(car_obj_path, scale= 1.0, center_y=0.0)
             if tri_uv and tex_path:
                 tex = create_texture_2d(tex_path)
                 if tex:
@@ -465,8 +481,14 @@ class AVHMI(pyglet.window.Window):
 
         # Lanes + grid (colored pipeline)
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
-        grid_v, grid_c = make_grid(100, 2.0)
-        self.grid  = Mesh(grid_v,  grid_c,  None, None, gl.GL_LINES,     mat4_identity())
+        
+        self.tile_size   = 40.0      # meters per tile
+        self.tile_step   = 2.0       # grid line spacing
+        self.tile_radius = 3         # tiles to keep around ego in each axis
+
+        gv, gc = make_grid_tile(self.tile_size, self.tile_step)
+        self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity())  # one VBO reused
+        self.grid_tiles = {}  # {(ix, iz): model_matrix}
         self.lanes = [Mesh(*make_polyline(pts), None, None, gl.GL_LINES, mat4_identity()) for pts in lane_pts]
 
         # Camera (initialize behind the car)
@@ -478,6 +500,26 @@ class AVHMI(pyglet.window.Window):
         self.renderer = Renderer()
         self.last_time = time.perf_counter()
         pyglet.clock.schedule_interval(self.update, 1.0/self.fps)
+
+    def _stream_grid(self):
+        # Which tile is the ego in?
+        ix = int(math.floor(self.ego.pos[0] / self.tile_size))
+        iz = int(math.floor(self.ego.pos[2] / self.tile_size))
+
+        needed = set()
+        for i in range(ix - self.tile_radius, ix + self.tile_radius + 1):
+            for j in range(iz - self.tile_radius, iz + self.tile_radius + 1):
+                needed.add((i, j))
+                if (i, j) not in self.grid_tiles:
+                    # place tile centers on a regular lattice
+                    mx = i * self.tile_size
+                    mz = j * self.tile_size
+                    self.grid_tiles[(i, j)] = mat4_translate(mx, 0.0, mz)
+
+        # Drop tiles that are far behind
+        to_delete = [key for key in self.grid_tiles.keys() if key not in needed]
+        for key in to_delete:
+            del self.grid_tiles[key]
 
     # Input
     def on_mouse_press(self, x, y, button, modifiers):
@@ -506,6 +548,7 @@ class AVHMI(pyglet.window.Window):
         steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
 
         self.ego.update(dt, throttle, steer_cmd, brake)
+        self._stream_grid()
 
         for o in self.obstacles:
             o.update(dt)
@@ -527,8 +570,11 @@ class AVHMI(pyglet.window.Window):
         view = look_at((cx, cy, cz), (tx, ty, tz), (0.0, 1.0, 0.0))
         pv = mat4_mul(proj, view)
 
-        # Draw world
-        self.renderer.draw_mesh(self.grid, pv)
+        # Draw world with streaming grid
+        for _key, model in self.grid_tiles.items():
+            self.grid_base.model = model
+            self.renderer.draw_mesh(self.grid_base, pv)
+
         for ln in self.lanes:
             self.renderer.draw_mesh(ln, pv)
 
@@ -542,11 +588,8 @@ class AVHMI(pyglet.window.Window):
         for o in self.obstacles:
             self.renderer.draw_mesh(o.mesh, pv)
 
-        # HUD
-        pyglet.text.Label(
-            f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg",
-            font_name="Arial", font_size=12, x=10, y=10
-        ).draw()
+        self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
+        self.hud.draw()
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
