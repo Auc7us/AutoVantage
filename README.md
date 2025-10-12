@@ -85,8 +85,8 @@ The application's server is available both as a python scripts and docker image.
 - Setup a virtual environment:
 
     ```bash
-    python3 -m venv .ballsim
-    source .ballsim/bin/activate
+    python3 -m venv .wav
+    source .wav/bin/activate
     ```
 - Install requirements:
 
