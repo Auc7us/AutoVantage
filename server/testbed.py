@@ -151,6 +151,20 @@ def mat4_rotate_y(theta):
             -s,0, c,0,
              0,0, 0,1]
 
+def mat4_rotate_x(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return [1,0,0,0,
+            0,c,-s,0,
+            0,s, c,0,
+            0,0,0,1]
+
+def mat4_rotate_z(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return [ c,-s,0,0,
+             s, c,0,0,
+             0, 0,1,0,
+             0, 0,0,1]
+
 def perspective(fovy_deg, aspect, znear, zfar):
     f = 1.0 / math.tan(math.radians(fovy_deg)/2.0)
     nf = 1.0 / (znear - zfar)
@@ -289,7 +303,7 @@ class Ego:
         self.max_steer = math.radians(35.0)
         self.max_steer_rate = math.radians(120.0)
         # longitudinal
-        self.max_accel = 3.0
+        self.max_accel = 15.0
         self.max_brake = 6.0
         self.c_roll = 0.015
         self.c_drag = 0.35
@@ -472,6 +486,62 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"WARNING: failed to load '{car_obj_path}': {e}")
 
+        # Wheels
+        self.wheels = []  # list of dicts: {'mesh': Mesh, 'offset': (x,y,z), 'steer': bool, 'radius': float}
+        whl_R_obj_path = "assets/whl/whl_R.obj"
+        whl_L_obj_path = "assets/whl/whl_L.obj"
+        try:
+            wpos_r, wuv_r, wtex_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0) 
+            wpos_l, wuv_l, wtex_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
+            
+            if wuv_r and wtex_r:
+                wtex_r_obj = create_texture_2d(wtex_r)
+                wmesh_r = Mesh(wpos_r, None, wuv_r, (wtex_r_obj.id if wtex_r_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
+            else:
+                wcols = [(0.15, 0.15, 0.15)] * len(wpos_r)
+                wmesh_r = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+
+            if wuv_l and wtex_l:
+                wtex_l_obj = create_texture_2d(wtex_l)
+                wmesh_l = Mesh(wpos_l, None, wuv_l, (wtex_l_obj.id if wtex_l_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
+            else:
+                wcols = [(0.15, 0.15, 0.15)] * len(wpos_l)
+                wmesh_l = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+
+            self.wheels.append({
+                'mesh': wmesh_r,
+                'offset': (0.825, 0.35, -1.6625),  # relative to car center
+                'steer': True,                    # set False for non-steering wheels
+                'radius': 0.35
+            })
+
+            self.wheels.append({
+                'mesh': wmesh_l,
+                'offset': (-0.825, 0.35, -1.6625),  # relative to car center
+                'steer': True,                    # set False for non-steering wheels
+                'radius': 0.35
+            })
+
+            self.wheels.append({
+                'mesh': wmesh_r,
+                'offset': (0.8, 0.35, 1.2225),  # relative to car center
+                'steer': False,                    # set False for non-steering wheels
+                'radius': 0.35
+            })
+
+            self.wheels.append({
+                'mesh': wmesh_l,
+                'offset': (-0.8, 0.35, 1.2225),  # relative to car center
+                'steer': False,                    # set False for non-steering wheels
+                'radius': 0.35
+            })
+
+        except Exception as e:
+            print(f"WARNING: failed to load wheel '{whl_obj_path}': {e}")
+
+        # Rolling state
+        self._wheel_roll = 0.0
+
         # Obstacles
         rng = random.Random(42)
         self.obstacles: List[MovingBox] = [
@@ -548,6 +618,9 @@ class AVHMI(pyglet.window.Window):
         steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
 
         self.ego.update(dt, throttle, steer_cmd, brake)
+        for w in self.wheels:
+            r = max(1e-6, w['radius'])
+            self._wheel_roll += (self.ego.v / r) * dt
         self._stream_grid()
 
         for o in self.obstacles:
@@ -578,12 +651,38 @@ class AVHMI(pyglet.window.Window):
         for ln in self.lanes:
             self.renderer.draw_mesh(ln, pv)
 
+        # # Draw car
+        # if self.car_mesh:
+        #     self.car_mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
+        #     self.renderer.draw_mesh(self.car_mesh, pv)
+        # else:
+        #     self.renderer.draw_mesh(self.ego.mesh, pv)
+
+        # Car model matrix once
+        car_T = mat4_translate(*self.ego.pos)
+        car_R = mat4_rotate_y(self.ego.yaw)
+        car_M = mat4_mul(car_T, car_R)
+
         # Draw car
         if self.car_mesh:
-            self.car_mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
+            self.car_mesh.model = car_M
             self.renderer.draw_mesh(self.car_mesh, pv)
         else:
+            self.ego.mesh.model = car_M
             self.renderer.draw_mesh(self.ego.mesh, pv)
+
+        # Wheels
+        steer_angle = self.ego.steer if self.wheels and self.wheels[0]['steer'] else 0.0
+        for w in self.wheels:
+            ox, oy, oz = w['offset']
+            M = car_M
+            M = mat4_mul(M, mat4_translate(ox, oy, oz))
+            if w['steer']:
+                M = mat4_mul(M, mat4_rotate_y(steer_angle))  # steer about local Y
+            M = mat4_mul(M, mat4_rotate_x(self._wheel_roll))  # roll about local X
+            w['mesh'].model = M
+            self.renderer.draw_mesh(w['mesh'], pv)
+
 
         for o in self.obstacles:
             self.renderer.draw_mesh(o.mesh, pv)

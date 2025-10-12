@@ -1,6 +1,6 @@
 # Blender 4.5.3 LTS
 # www.blender.org
-mtllib whl.mtl
+mtllib whl_R.mtl
 o whl.033
 v 0.069317 0.048437 0.112075
 v 0.066990 0.060145 0.100975
