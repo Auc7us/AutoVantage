@@ -343,6 +343,88 @@ class MovingBox:
         self.pos[2] += self.vz*dt
         self.mesh.model = mat4_translate(*self.pos)
 
+
+class MovingCharacter:
+    """Simple wrapper for a character mesh with a world position.
+    Characters are static by default but provide an update() hook for future animation.
+    """
+    def __init__(self, mesh: Mesh, x: float = 0.0, y: float = 0.0, z: float = 0.0):
+        self.mesh = mesh
+        self.pos = [x, y, z]
+
+    def update(self, dt: float):
+        # placeholder for animation / movement
+        # keep mesh.model in sync with pos
+        self.mesh.model = mat4_translate(*self.pos)
+
+
+class TrafficLight:
+    """Simple traffic light with a vertical pole and three lamps (red/yellow/green).
+    Each lamp is a small box. The traffic light cycles states every `state_duration` seconds.
+    """
+    def __init__(self, x: float, z: float, pole_height: float = 3.5, state_duration: float = 5.0):
+        self.x = x
+        self.z = z
+        self.pole_height = pole_height
+        self.state_duration = state_duration
+        # 0=red,1=green,2=yellow (we'll step through them every state_duration seconds)
+        self.state = 0
+        self.timer = 0.0
+
+        # Create pole mesh (thin box)
+        pole_w = 0.12
+        pole_h = pole_height
+        pole_d = 0.12
+        vp, cp = make_box_triangles(pole_w, pole_h, pole_d, (0.15, 0.15, 0.15))
+        # position pole so base sits at y=0
+        pole_model = mat4_translate(self.x, pole_h * 0.5, self.z)
+        self.pole_mesh = Mesh(vp, cp, None, None, gl.GL_TRIANGLES, pole_model)
+
+        # Create lamp boxes (stacked near top). We'll make three small boxes and toggle their colors.
+        lamp_w, lamp_h, lamp_d = 0.28, 0.24, 0.14
+        # lamp vertical offsets (top=red, mid=yellow, bottom=green)
+        top_y = pole_h - 0.25
+        mid_y = pole_h - 0.55
+        bot_y = pole_h - 0.85
+
+        self.lamps = []  # list of (mesh, base_colors)
+        for ly in (top_y, mid_y, bot_y):
+            lv, lc = make_box_triangles(lamp_w, lamp_h, lamp_d, (0.1, 0.1, 0.1))
+            lm = Mesh(lv, lc, None, None, gl.GL_TRIANGLES, mat4_translate(self.x + 0.0, ly, self.z + 0.0))
+            self.lamps.append(lm)
+
+        # colors for states
+        self.colors_active = [ (1.0, 0.08, 0.08), (0.98, 0.9, 0.0), (0.06, 0.9, 0.06) ]  # red, yellow, green
+        self.colors_dim    = [ (0.18, 0.02, 0.02), (0.18, 0.16, 0.02), (0.02, 0.18, 0.02) ]
+        # Initialize lamp colors according to state
+        self._apply_lamp_colors()
+
+    def _apply_lamp_colors(self):
+        # top=red (index 0), mid=yellow (1), bot=green (2)
+        for i, lm in enumerate(self.lamps):
+            active = (i == 0 and self.state == 0) or (i == 2 and self.state == 1) or (i == 1 and self.state == 2)
+            col = self.colors_active[i] if active else self.colors_dim[i]
+            # update per-vertex colors
+            lm.cols = [col] * len(lm.verts)
+            # force VBO rebuild next draw
+            if hasattr(lm, '_gpu'):
+                del lm._gpu
+
+    def update(self, dt: float):
+        self.timer += dt
+        if self.timer >= self.state_duration:
+            self.timer -= self.state_duration
+            # advance state 0->1->2->0
+            self.state = (self.state + 1) % 3
+            self._apply_lamp_colors()
+
+    def draw(self, renderer, proj_view):
+        # draw pole
+        renderer.draw_mesh(self.pole_mesh, proj_view)
+        # draw lamps
+        for lm in self.lamps:
+            renderer.draw_mesh(lm, proj_view)
+
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
 # ------------------------------------------------------------
@@ -546,7 +628,7 @@ class AVHMI(pyglet.window.Window):
             })
 
         except Exception as e:
-            print(f"WARNING: failed to load wheel '{whl_obj_path}': {e}")
+            print(f"WARNING: failed to load wheels: {e}")
 
         # Rolling state
         self._wheel_roll = 0.0
@@ -557,6 +639,61 @@ class AVHMI(pyglet.window.Window):
             MovingBox(rng.uniform(-4,4), 0.8, -rng.uniform(10,60), 4.0, 1.6, 1.8, (0.9,0.2,0.2))
             for _ in range(6)
         ]
+
+        # Characters (humans)
+        self.characters: List[MovingCharacter] = []
+        human_obj_path = "assets/human/human.obj"
+        try:
+            hpos, huv, htex = load_obj_with_uv_mtl(human_obj_path, scale=1.0, center_y=0.0)
+            # Scale the human mesh so its height matches a realistic human height
+            if hpos:
+                ys = [p[1] for p in hpos]
+                ymin, ymax = min(ys), max(ys)
+                model_h = max(1e-6, ymax - ymin)
+                desired_h = 1.82  # target human height in meters (adjustable)
+                s = desired_h / model_h
+                # shift so feet sit at y=0, then scale
+                hpos_scaled = [(x*s, (y - ymin)*s, z*s) for (x, y, z) in hpos]
+            else:
+                hpos_scaled = hpos
+
+            if huv and htex:
+                tex_obj = create_texture_2d(htex)
+                if tex_obj:
+                    hmesh = Mesh(hpos_scaled, None, huv, tex_obj.id, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0), _tex_obj=tex_obj)
+                else:
+                    # fallback to colored
+                    cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
+                    hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            else:
+                # no UV/texture: fallback colored mesh
+                cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
+                hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            self.characters.append(MovingCharacter(hmesh, 2.0, 0.0, -8.0))
+            try:
+                tris = len(hpos_scaled)//3
+            except Exception:
+                tris = 0
+            print(f"Loaded human model: {tris} tris (scale {s:.3f} -> height {desired_h} m)")
+        except Exception as e:
+            print(f"WARNING: failed to load human '{human_obj_path}': {e}")
+            # fallback simple box as placeholder
+            v, c = make_box_triangles(0.6, 1.8, 0.4, (0.8, 0.7, 0.6))
+            fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
+
+        # Traffic lights
+        self.traffic_lights: List[TrafficLight] = []
+        # place one traffic light next to the human (offset so it's beside them)
+        try:
+            tl_x = 2.6
+            tl_z = -8.0
+            # choose pole height relative to vehicle height (vehicle height ~1.6m, pole ~2.0x)
+            pole_h = max(2.8, self.ego.height * 2.0)
+            self.traffic_lights.append(TrafficLight(tl_x, tl_z, pole_height=pole_h, state_duration=5.0))
+            print(f"Placed traffic light at ({tl_x},{tl_z}) height {pole_h}m")
+        except Exception as e:
+            print(f"WARNING: failed to create traffic light: {e}")
 
         # Lanes + grid (colored pipeline)
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
@@ -637,6 +774,12 @@ class AVHMI(pyglet.window.Window):
             o.update(dt)
             if o.pos[2] > 10:
                 o.pos[2] = -80.0
+        # update characters (placeholder for animations)
+        for ch in self.characters:
+            ch.update(dt)
+        # update traffic lights
+        for tl in getattr(self, 'traffic_lights', []):
+            tl.update(dt)
 
     # Draw
     def on_draw(self):
@@ -692,6 +835,15 @@ class AVHMI(pyglet.window.Window):
 
         for o in self.obstacles:
             self.renderer.draw_mesh(o.mesh, pv)
+
+        # Draw characters (humans)
+        for ch in self.characters:
+            # ch.mesh.model is kept updated in ch.update()
+            self.renderer.draw_mesh(ch.mesh, pv)
+
+        # Draw traffic lights
+        for tl in getattr(self, 'traffic_lights', []):
+            tl.draw(self.renderer, pv)
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()

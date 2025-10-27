@@ -501,8 +501,8 @@ async def main(
     shutdown = asyncio.Event()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown.set)
+    # for sig in (signal.SIGINT, signal.SIGTERM):
+    #     loop.add_signal_handler(sig, shutdown.set)
 
     print("use ctrl+c to stop server")
     await shutdown.wait()
