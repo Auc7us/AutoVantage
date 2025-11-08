@@ -357,73 +357,49 @@ class MovingCharacter:
         # keep mesh.model in sync with pos
         self.mesh.model = mat4_translate(*self.pos)
 
-
+# ------------------------------------------------------------
+# Traffic Light
+# ------------------------------------------------------------
 class TrafficLight:
-    """Simple traffic light with a vertical pole and three lamps (red/yellow/green).
-    Each lamp is a small box. The traffic light cycles states every `state_duration` seconds.
-    """
-    def __init__(self, x: float, z: float, pole_height: float = 3.5, state_duration: float = 5.0):
-        self.x = x
-        self.z = z
-        self.pole_height = pole_height
-        self.state_duration = state_duration
-        # 0=red,1=green,2=yellow (we'll step through them every state_duration seconds)
-        self.state = 0
-        self.timer = 0.0
-
-        # Create pole mesh (thin box)
-        pole_w = 0.12
-        pole_h = pole_height
-        pole_d = 0.12
-        vp, cp = make_box_triangles(pole_w, pole_h, pole_d, (0.15, 0.15, 0.15))
-        # position pole so base sits at y=0
-        pole_model = mat4_translate(self.x, pole_h * 0.5, self.z)
-        self.pole_mesh = Mesh(vp, cp, None, None, gl.GL_TRIANGLES, pole_model)
-
-        # Create lamp boxes (stacked near top). We'll make three small boxes and toggle their colors.
-        lamp_w, lamp_h, lamp_d = 0.28, 0.24, 0.14
-        # lamp vertical offsets (top=red, mid=yellow, bottom=green)
-        top_y = pole_h - 0.25
-        mid_y = pole_h - 0.55
-        bot_y = pole_h - 0.85
-
-        self.lamps = []  # list of (mesh, base_colors)
-        for ly in (top_y, mid_y, bot_y):
-            lv, lc = make_box_triangles(lamp_w, lamp_h, lamp_d, (0.1, 0.1, 0.1))
-            lm = Mesh(lv, lc, None, None, gl.GL_TRIANGLES, mat4_translate(self.x + 0.0, ly, self.z + 0.0))
-            self.lamps.append(lm)
-
-        # colors for states
-        self.colors_active = [ (1.0, 0.08, 0.08), (0.98, 0.9, 0.0), (0.06, 0.9, 0.06) ]  # red, yellow, green
-        self.colors_dim    = [ (0.18, 0.02, 0.02), (0.18, 0.16, 0.02), (0.02, 0.18, 0.02) ]
-        # Initialize lamp colors according to state
-        self._apply_lamp_colors()
-
-    def _apply_lamp_colors(self):
-        # top=red (index 0), mid=yellow (1), bot=green (2)
-        for i, lm in enumerate(self.lamps):
-            active = (i == 0 and self.state == 0) or (i == 2 and self.state == 1) or (i == 1 and self.state == 2)
-            col = self.colors_active[i] if active else self.colors_dim[i]
-            # update per-vertex colors
-            lm.cols = [col] * len(lm.verts)
-            # force VBO rebuild next draw
-            if hasattr(lm, '_gpu'):
-                del lm._gpu
+    def __init__(self, x=0.0, y=3.0, z=0.0):
+        # Create light housing
+        box_width = 0.5
+        box_height = 1.35
+        box_depth = 0.25
+        box_verts, box_cols = make_box_triangles(box_width, box_height, box_depth, (0.2, 0.2, 0.2))
+        
+        # Create the three lights
+        light_size = 0.25
+        light_depth = 0.1
+        
+        # Calculate even spacing
+        spacing = (box_height - 3*light_size) / 4
+        
+        # Red light (top)
+        red_y = box_height - spacing - light_size
+        red_verts, red_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.1, 0.1))  # Red
+        red_verts = [(x, y + red_y, z + box_depth/2) for x, y, z in red_verts]
+        
+        # Yellow light (middle)
+        yellow_y = box_height - 2*spacing - 2*light_size
+        yellow_verts, yellow_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.9, 0.1))  # Yellow
+        yellow_verts = [(x, y + yellow_y, z + box_depth/2) for x, y, z in yellow_verts]
+        
+        # Green light (bottom)
+        green_y = box_height - 3*spacing - 3*light_size
+        green_verts, green_cols = make_box_triangles(light_size, light_size, light_depth, (0.1, 0.9, 0.1))  # Green
+        green_verts = [(x, y + green_y, z + box_depth/2) for x, y, z in green_verts]
+        
+        # Combine all vertices and colors
+        all_verts = box_verts + red_verts + yellow_verts + green_verts
+        all_cols = box_cols + red_cols + yellow_cols + green_cols
+        
+        # Create the mesh
+        self.mesh = Mesh(all_verts, all_cols, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+        self.pos = [x, y, z]
 
     def update(self, dt: float):
-        self.timer += dt
-        if self.timer >= self.state_duration:
-            self.timer -= self.state_duration
-            # advance state 0->1->2->0
-            self.state = (self.state + 1) % 3
-            self._apply_lamp_colors()
-
-    def draw(self, renderer, proj_view):
-        # draw pole
-        renderer.draw_mesh(self.pole_mesh, proj_view)
-        # draw lamps
-        for lm in self.lamps:
-            renderer.draw_mesh(lm, proj_view)
+        self.mesh.model = mat4_translate(*self.pos)
 
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
@@ -682,25 +658,15 @@ class AVHMI(pyglet.window.Window):
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
 
-        # Traffic lights
-        self.traffic_lights: List[TrafficLight] = []
-        # place one traffic light next to the human (offset so it's beside them)
-        try:
-            tl_x = 2.6
-            tl_z = -8.0
-            # choose pole height relative to vehicle height (vehicle height ~1.6m, pole ~2.0x)
-            pole_h = max(2.8, self.ego.height * 2.0)
-            self.traffic_lights.append(TrafficLight(tl_x, tl_z, pole_height=pole_h, state_duration=5.0))
-            print(f"Placed traffic light at ({tl_x},{tl_z}) height {pole_h}m")
-        except Exception as e:
-            print(f"WARNING: failed to create traffic light: {e}")
-
         # Lanes + grid (colored pipeline)
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
         
         self.tile_size   = 40.0      # meters per tile
         self.tile_step   = 2.0       # grid line spacing
         self.tile_radius = 3         # tiles to keep around ego in each axis
+        
+        # Traffic Light
+        self.traffic_light = TrafficLight(x=3.0, y=3.0, z=-10.0)
 
         gv, gc = make_grid_tile(self.tile_size, self.tile_step)
         self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity())  # one VBO reused
@@ -777,9 +743,6 @@ class AVHMI(pyglet.window.Window):
         # update characters (placeholder for animations)
         for ch in self.characters:
             ch.update(dt)
-        # update traffic lights
-        for tl in getattr(self, 'traffic_lights', []):
-            tl.update(dt)
 
     # Draw
     def on_draw(self):
@@ -836,14 +799,13 @@ class AVHMI(pyglet.window.Window):
         for o in self.obstacles:
             self.renderer.draw_mesh(o.mesh, pv)
 
+        # Draw traffic light
+        self.renderer.draw_mesh(self.traffic_light.mesh, pv)
+
         # Draw characters (humans)
         for ch in self.characters:
             # ch.mesh.model is kept updated in ch.update()
             self.renderer.draw_mesh(ch.mesh, pv)
-
-        # Draw traffic lights
-        for tl in getattr(self, 'traffic_lights', []):
-            tl.draw(self.renderer, pv)
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
