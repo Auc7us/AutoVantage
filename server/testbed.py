@@ -236,7 +236,7 @@ void main(){
 """
 
 # ------------------------------------------------------------
-# Geometry builders for lines/boxes (color pipeline)
+# Geometry builders for lines/boxes
 # ------------------------------------------------------------
 def make_box_triangles(lx, ly, lz, color=(0.1, 0.8, 0.3)):
     x0,x1 = -lx*0.5, lx*0.5
@@ -276,6 +276,80 @@ def make_grid(size=80, step=2.0, color=(0.25, 0.25, 0.25)):
         verts += [(v, 0.0, -s), (v, 0.0,  s)]
         cols  += [color,        color]
         v += step
+    return verts, cols
+
+# ------------------------------------------------------------
+# Street sign builders
+# ------------------------------------------------------------
+def make_regular_polygon(n: int, radius: float, thickness: float, color=(1.0,1.0,1.0), angle_offset: float = 0.0):
+    import math
+    verts = []
+    cols  = []
+    ring = []
+    for i in range(n):
+        ang = (2*math.pi * i) / n + angle_offset
+        x = radius * math.cos(ang)
+        z = radius * math.sin(ang)
+        ring.append((x, 0.0, z))
+
+    for i in range(1, n-1):
+        a = ring[0]; b = ring[i]; c = ring[i+1]
+        verts.extend([a, b, c]); cols.extend([color, color, color])
+
+    back_ring = [(x, -thickness, z) for (x, _y, z) in ring]
+
+    for i in range(1, n-1):
+        a = back_ring[0]; b = back_ring[i+1]; c = back_ring[i]
+        verts.extend([a, b, c]); cols.extend([color, color, color])
+
+    for i in range(n):
+        j = (i+1) % n
+        a = ring[i]; b = ring[j]; c = back_ring[i]; d = back_ring[j]
+        verts.extend([a, b, d, a, d, c]); cols.extend([color]*6)
+    return verts, cols
+
+def make_triangle_sign(size: float, thickness: float, color=(1.0,1.0,1.0)):
+    import math
+    r = size / math.sqrt(3.0)
+    return make_regular_polygon(3, r, thickness, color, angle_offset=-math.pi/2)
+
+def make_octagon_sign(size: float, thickness: float, color=(1.0,0.1,0.1)):
+    r = size
+    return make_regular_polygon(8, r, thickness, color)
+
+def make_rect_sign(width: float, height: float, thickness: float, color=(1.0,1.0,1.0)):
+    return make_box_triangles(width, thickness, height, color)
+
+# ------------------------------------------------------------
+# Barricade builder: trapezoidal prism
+# ------------------------------------------------------------
+def make_trapezoid_prism(base_len: float, base_depth: float, top_len: float, top_depth: float, height: float, color=(1.0, 0.5, 0.0)):
+
+    bx0, bx1 = -base_len*0.5, base_len*0.5
+    bz0, bz1 = -base_depth*0.5, base_depth*0.5
+    tx0, tx1 = -top_len*0.5, top_len*0.5
+    tz0, tz1 = -top_depth*0.5, top_depth*0.5
+    y0, y1 = 0.0, height
+
+    verts = []
+    cols  = []
+
+    # Top face
+    verts += [(tx0,y1,tz0),(tx1,y1,tz0),(tx1,y1,tz1), (tx0,y1,tz0),(tx1,y1,tz1),(tx0,y1,tz1)]
+    cols  += [color]*6
+    # Bottom face
+    verts += [(bx0,y0,bz0),(bx1,y0,bz1),(bx1,y0,bz0), (bx0,y0,bz0),(bx0,y0,bz1),(bx1,y0,bz1)]
+    cols  += [color]*6
+    # Side faces
+    verts += [(bx1,y0,bz0),(bx1,y0,bz1),(tx1,y1,tz1), (bx1,y0,bz0),(tx1,y1,tz1),(tx1,y1,tz0)]
+    cols  += [color]*6
+    verts += [(bx0,y0,bz0),(tx0,y1,tz0),(tx0,y1,tz1), (bx0,y0,bz0),(tx0,y1,tz1),(bx0,y0,bz1)]
+    cols  += [color]*6
+    verts += [(bx0,y0,bz1),(tx0,y1,tz1),(tx1,y1,tz1), (bx0,y0,bz1),(tx1,y1,tz1),(bx1,y0,bz1)]
+    cols  += [color]*6
+    verts += [(bx0,y0,bz0),(bx1,y0,bz0),(tx1,y1,tz0), (bx0,y0,bz0),(tx1,y1,tz0),(tx0,y1,tz0)]
+    cols  += [color]*6
+
     return verts, cols
 
 # ------------------------------------------------------------
@@ -343,6 +417,22 @@ class MovingBox:
         self.pos[2] += self.vz*dt
         self.mesh.model = mat4_translate(*self.pos)
 
+class MovingBarricade:
+    """Orange work zone barricade (trapezoidal prism) that can move like MovingBox."""
+    def __init__(self, x, y, z,
+                 base_len=1.8, base_depth=0.6,
+                 top_len=1.4, top_depth=0.4,
+                 height=1.0,
+                 color=(1.0, 0.5, 0.0), vel=(0.0, 0.0, 0.0)):
+        v, c = make_trapezoid_prism(base_len, base_depth, top_len, top_depth, height, color)
+        self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x,y,z), mat4_identity()))
+        self.vx, self.vy, self.vz = vel
+        self.pos = [x, y, z]
+    def update(self, dt):
+        self.pos[0] += self.vx*dt
+        self.pos[1] += self.vy*dt
+        self.pos[2] += self.vz*dt
+        self.mesh.model = mat4_translate(*self.pos)
 
 class MovingCharacter:
     """Simple wrapper for a character mesh with a world position.
@@ -353,9 +443,21 @@ class MovingCharacter:
         self.pos = [x, y, z]
 
     def update(self, dt: float):
-        # placeholder for animation / movement
-        # keep mesh.model in sync with pos
         self.mesh.model = mat4_translate(*self.pos)
+
+class SurroundingVehicle:
+    """Wrapper for surrounding vehicle meshes with world position (static) and wheels."""
+    def __init__(self, mesh: Mesh, x: float = 0.0, y: float = 0.0, z: float = 0.0):
+        self.mesh = mesh
+        self.pos = [x, y, z]
+        self.wheels: List[dict] = []
+
+    def update(self, dt: float):
+        M = mat4_translate(*self.pos)
+        self.mesh.model = M
+        for w in self.wheels:
+            ox, oy, oz = w['offset']
+            w['mesh'].model = mat4_mul(M, mat4_translate(ox, oy, oz))
 
 # ------------------------------------------------------------
 # Traffic Light
@@ -400,6 +502,45 @@ class TrafficLight:
 
     def update(self, dt: float):
         self.mesh.model = mat4_translate(*self.pos)
+
+# ------------------------------------------------------------
+# Street Signs
+# ------------------------------------------------------------
+class StreetSign:
+    def __init__(self, kind: str = 'stop', x: float = 0.0, y: float = 0.0, z: float = 0.0, yaw: float = 0.0, y_adjust: float = 0.0, scale: float = 1.0):
+        self.kind = kind
+        self.pos = [x, y, z]
+        self.yaw = yaw
+        self.y_adjust = y_adjust
+        self.scale = scale
+        pole_h = 2.6 * 0.75
+        pole_w = 0.08
+        pole_d = 0.08
+        pv, pc = make_box_triangles(pole_w, pole_h, pole_d, (0.7,0.7,0.7))
+        self.pole_mesh = Mesh(pv, pc, None, None, gl.GL_TRIANGLES, mat4_identity())
+        thickness = 0.02
+        if kind == 'stop':
+            panel_size = 0.74 * 0.6
+            sv, sc = make_regular_polygon(6, panel_size, thickness, (0.9, 0.1, 0.1))
+        elif kind == 'yield':
+            panel_size = 0.9
+            sv, sc = make_triangle_sign(panel_size * getattr(self, 'scale', 1.0), thickness, (1.0, 1.0, 1.0))
+        else:
+            width, height = 0.55, 0.75
+            sv, sc = make_rect_sign(width, height, thickness, (1.0, 1.0, 1.0))
+        panel_y = y + pole_h + thickness*0.5
+        self.panel_offset = (0.0, pole_h + thickness*0.5 + self.y_adjust, pole_d*0.5 + thickness*0.5)
+        self.panel_mesh = Mesh(sv, sc, None, None, gl.GL_TRIANGLES, mat4_identity())
+
+    def update(self, dt: float):
+        M = mat4_translate(*self.pos)
+        self.pole_mesh.model = M
+        ox, oy, oz = self.panel_offset
+        Mp = mat4_mul(M, mat4_translate(ox, oy, oz))
+        Mp = mat4_mul(Mp, mat4_rotate_x(math.radians(90.0)))
+        if getattr(self, 'yaw', 0.0) != 0.0:
+            Mp = mat4_mul(Mp, mat4_rotate_y(self.yaw))
+        self.panel_mesh.model = Mp
 
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
@@ -474,7 +615,7 @@ class Renderer:
             self.prog_tex['u_mvp'] = mvp
             gl.glActiveTexture(gl.GL_TEXTURE0)
             gl.glBindTexture(gl.GL_TEXTURE_2D, mesh.texture_id)
-            self.prog_tex['u_tex'] = 0  # be explicit
+            self.prog_tex['u_tex'] = 0
         else:
             self.prog_color.use()
             self.prog_color['u_mvp'] = mvp
@@ -492,7 +633,7 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
     except Exception as e:
         print(f"Failed to load texture '{path}': {e}")
         return None
-    tex = img.get_texture()  # pyglet.image.Texture
+    tex = img.get_texture()
     gl.glBindTexture(gl.GL_TEXTURE_2D, tex.id)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
@@ -510,7 +651,7 @@ class AVHMI(pyglet.window.Window):
         super().__init__(width=width, height=height, caption="AV HMI 3D", resizable=True, config=cfg)
         self.fps = fps
         gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glDisable(gl.GL_CULL_FACE)  # avoid invisible OBJ if normals/winding are off
+        gl.glDisable(gl.GL_CULL_FACE)
         gl.glClearColor(0.05, 0.06, 0.09, 1.0)
 
         self.keys = key.KeyStateHandler()
@@ -533,7 +674,7 @@ class AVHMI(pyglet.window.Window):
                     self.car_mesh = Mesh(
                         tri_pos, None, tri_uv, self.tex_normal.id, gl.GL_TRIANGLES,
                         mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw)),
-                        _tex_obj=self.tex_normal,  # keep it alive
+                        _tex_obj=self.tex_normal,
                     )
                     print(f"Loaded textured car: {len(tri_pos)//3} tris, tex='{tex_path}'")
                 base, ext = os.path.splitext(tex_path)
@@ -544,7 +685,6 @@ class AVHMI(pyglet.window.Window):
                 else:
                     print("No _brake texture found, using default")
             if self.car_mesh is None:
-                # Fallback: flat color if no UV/texture
                 color = (0.12, 0.75, 0.90)
                 cols  = [color] * len(tri_pos)
                 self.car_mesh = Mesh(tri_pos, cols, None, None, gl.GL_TRIANGLES,
@@ -609,12 +749,15 @@ class AVHMI(pyglet.window.Window):
         # Rolling state
         self._wheel_roll = 0.0
 
-        # Obstacles
-        rng = random.Random(42)
-        self.obstacles: List[MovingBox] = [
-            MovingBox(rng.uniform(-4,4), 0.8, -rng.uniform(10,60), 4.0, 1.6, 1.8, (0.9,0.2,0.2))
-            for _ in range(6)
+        # Orange barricade
+        bl, bd = 1.8*0.85, 0.6*0.85  # 15% smaller
+        tl, td = 1.4*0.85, 0.4*0.85
+        h      = 1.0*0.85
+        bx, by, bz = 3.0 + 1.2, 0.0, -10.0
+        self.obstacles: List[MovingBarricade] = [
+            MovingBarricade(bx, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(1.0, 0.5, 0.0))
         ]
+        self.show_obstacles = True
 
         # Characters (humans)
         self.characters: List[MovingCharacter] = []
@@ -628,7 +771,6 @@ class AVHMI(pyglet.window.Window):
                 model_h = max(1e-6, ymax - ymin)
                 desired_h = 1.82  # target human height in meters (adjustable)
                 s = desired_h / model_h
-                # shift so feet sit at y=0, then scale
                 hpos_scaled = [(x*s, (y - ymin)*s, z*s) for (x, y, z) in hpos]
             else:
                 hpos_scaled = hpos
@@ -658,6 +800,69 @@ class AVHMI(pyglet.window.Window):
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
 
+        # Surrounding vehicles
+        self.surrounding_vehicles: List[SurroundingVehicle] = []
+        surrounding_car_obj_path = "assets/WAutoCar.obj"
+        try:
+            sv_pos, sv_uv, sv_tex = load_obj_with_uv_mtl(surrounding_car_obj_path, scale=1.0, center_y=0.0)
+
+            # Load wheel geometry once
+            whl_R_obj_path = "assets/whl/whl_R.obj"
+            whl_L_obj_path = "assets/whl/whl_L.obj"
+            wpos_r, wuv_r, wtex_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0)
+            wpos_l, wuv_l, wtex_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
+            # Prepare wheel textures if available
+            wtex_r_obj = create_texture_2d(wtex_r) if (wuv_r and wtex_r) else None
+            wtex_l_obj = create_texture_2d(wtex_l) if (wuv_l and wtex_l) else None
+
+            # Create surrounding vehicle at a static position
+            for i in range(1):
+                lane_offset = -1.75 if i % 2 == 0 else 1.75  # Alternate lanes
+                z_pos = -20.0 - i * 15.0                      # Stagger along road
+
+                # Force colored gray mesh (ignore texture)
+                cols = [(0.6, 0.6, 0.6)] * len(sv_pos)
+                sv_mesh = Mesh(sv_pos, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+
+                vehicle = SurroundingVehicle(sv_mesh, lane_offset, 0.0, z_pos)
+                # Build static wheels for this vehicle
+                if wpos_r:
+                    if wuv_r and wtex_r_obj:
+                        wmesh_r_front = Mesh(wpos_r, None, wuv_r, wtex_r_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
+                        wmesh_r_rear  = Mesh(wpos_r, None, wuv_r, wtex_r_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
+                    else:
+                        wcols = [(0.15, 0.15, 0.15)] * len(wpos_r)
+                        wmesh_r_front = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+                        wmesh_r_rear  = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+                else:
+                    wmesh_r_front = None
+                    wmesh_r_rear  = None
+
+                if wpos_l:
+                    if wuv_l and wtex_l_obj:
+                        wmesh_l_front = Mesh(wpos_l, None, wuv_l, wtex_l_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
+                        wmesh_l_rear  = Mesh(wpos_l, None, wuv_l, wtex_l_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
+                    else:
+                        wcols = [(0.15, 0.15, 0.15)] * len(wpos_l)
+                        wmesh_l_front = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+                        wmesh_l_rear  = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
+                else:
+                    wmesh_l_front = None
+                    wmesh_l_rear  = None
+
+                # Add four wheels using same offsets as ego (no steer/roll)
+                if wmesh_r_front and wmesh_l_front and wmesh_r_rear and wmesh_l_rear:
+                    vehicle.wheels.append({'mesh': wmesh_r_front, 'offset': (0.825, 0.35, -1.6625)})
+                    vehicle.wheels.append({'mesh': wmesh_l_front, 'offset': (-0.825, 0.35, -1.6625)})
+                    vehicle.wheels.append({'mesh': wmesh_r_rear,  'offset': (0.8,   0.35,  1.2225)})
+                    vehicle.wheels.append({'mesh': wmesh_l_rear,  'offset': (-0.8,  0.35,  1.2225)})
+
+                self.surrounding_vehicles.append(vehicle)
+
+            print(f"Loaded {len(self.surrounding_vehicles)} surrounding vehicles")
+        except Exception as e:
+            print(f"WARNING: failed to load surrounding vehicle geometry from '{surrounding_car_obj_path}': {e}")
+
         # Lanes + grid (colored pipeline)
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
         
@@ -667,6 +872,30 @@ class AVHMI(pyglet.window.Window):
         
         # Traffic Light
         self.traffic_light = TrafficLight(x=3.0, y=3.0, z=-10.0)
+
+        # Street signs
+        self.street_signs: List[StreetSign] = []
+        try:
+            # Hexagon base position
+            stop_x, stop_y, stop_z = 3.5, 0.0, -15.0
+            self.sign_stop = StreetSign('stop', stop_x, stop_y, stop_z)
+            # Regular triangle 
+            scale_tri = 0.85  # reduce size by 15%
+            self.sign_regular_triangle = StreetSign('yield', stop_x + 1.4, stop_y, stop_z, scale=scale_tri)
+            # Inverted triangle
+            r = (0.9 * scale_tri) / math.sqrt(3.0)
+            self.sign_inverted_triangle = StreetSign('yield', stop_x + 2.8, stop_y, stop_z, yaw=math.pi, y_adjust=-(r*0.5), scale=scale_tri)
+            # Box sign
+            self.sign_speed = StreetSign('speed', stop_x + 4.2, stop_y, stop_z)
+
+            # Register signs for rendering
+            self.street_signs.append(self.sign_stop)
+            self.street_signs.append(self.sign_regular_triangle)
+            self.street_signs.append(self.sign_inverted_triangle)
+            self.street_signs.append(self.sign_speed)
+            print(f"Loaded {len(self.street_signs)} street signs")
+        except Exception as e:
+            print(f"WARNING: failed to build street signs: {e}")
 
         gv, gc = make_grid_tile(self.tile_size, self.tile_step)
         self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity())  # one VBO reused
@@ -736,13 +965,18 @@ class AVHMI(pyglet.window.Window):
             self._wheel_roll += (self.ego.v / r) * dt
         self._stream_grid()
 
-        for o in self.obstacles:
-            o.update(dt)
-            if o.pos[2] > 10:
-                o.pos[2] = -80.0
-        # update characters (placeholder for animations)
+        if getattr(self, 'show_obstacles', False):
+            for o in self.obstacles:
+                o.update(dt)
+        # update characters
         for ch in self.characters:
             ch.update(dt)
+        # update surrounding vehicles
+        for vehicle in self.surrounding_vehicles:
+            vehicle.update(dt)
+        # update street signs
+        for ss in self.street_signs:
+            ss.update(dt)
 
     # Draw
     def on_draw(self):
@@ -796,16 +1030,27 @@ class AVHMI(pyglet.window.Window):
             self.renderer.draw_mesh(w['mesh'], pv)
 
 
-        for o in self.obstacles:
-            self.renderer.draw_mesh(o.mesh, pv)
+        if getattr(self, 'show_obstacles', False):
+            for o in self.obstacles:
+                self.renderer.draw_mesh(o.mesh, pv)
 
         # Draw traffic light
         self.renderer.draw_mesh(self.traffic_light.mesh, pv)
 
-        # Draw characters (humans)
+        # Draw street signs
+        for ss in self.street_signs:
+            self.renderer.draw_mesh(ss.pole_mesh, pv)
+            self.renderer.draw_mesh(ss.panel_mesh, pv)
+
+        # Draw characters
         for ch in self.characters:
-            # ch.mesh.model is kept updated in ch.update()
             self.renderer.draw_mesh(ch.mesh, pv)
+
+        # Draw surrounding vehicles
+        for vehicle in self.surrounding_vehicles:
+            self.renderer.draw_mesh(vehicle.mesh, pv)
+            for w in vehicle.wheels:
+                self.renderer.draw_mesh(w['mesh'], pv)
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
