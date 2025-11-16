@@ -8,6 +8,17 @@ from pyglet.window import key, mouse
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
+# GStreamer RTSP support for NVIDIA Jetson/GPUs
+_GST_AVAILABLE = False
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    gi.require_version('GstRtspServer', '1.0')
+    from gi.repository import Gst, GstRtspServer, GLib
+    Gst.init(None)
+except Exception:
+    _GST_AVAILABLE = False
+
 # ------------------------------------------------------------
 # Minimal MTL parser (grabs first map_Kd path)
 # ------------------------------------------------------------
@@ -363,7 +374,7 @@ class Mesh:
     texture_id: Optional[int]
     mode: int
     model: List[float]
-    _tex_obj: Optional[pyglet.image.Texture] = None  # keep alive
+    _tex_obj: Optional[pyglet.image.Texture] = None 
 
 class Ego:
     def __init__(self):
@@ -645,6 +656,101 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
+class RTSPStreamer:
+    def __init__(self, width: int, height: int, fps: int = 30, port: int = 8554, mount: str = "/sim"):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.port = port
+        self.mount = mount
+        self._loop = None
+        self._server = None
+        self._factory = None
+        self._appsrc = None
+        self._pts_ns = 0
+        self.is_active = False
+
+    def _choose_encoder(self):
+        if not _GST_AVAILABLE:
+            return None
+        try:
+            if Gst.ElementFactory.find("nvv4l2h264enc"):
+                return "nvv4l2h264enc insert-sps-pps=true maxperf-enable=true bitrate=4000000"
+            if Gst.ElementFactory.find("nvh264enc"):
+                return "nvh264enc bitrate=4000"
+        except Exception:
+            pass
+        return "x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000"
+
+    def start(self):
+        if not _GST_AVAILABLE:
+            print("RTSP disabled: GStreamer not available on this system")
+            return False
+        enc = self._choose_encoder()
+        if enc is None:
+            print("RTSP disabled: no H.264 encoder available")
+            return False
+        launch = (
+            f"appsrc name=mysrc is-live=true format=GST_FORMAT_TIME caps=video/x-raw,format=RGB,width={self.width},height={self.height},framerate={self.fps}/1 "
+            f"! videoconvert ! {enc} ! rtph264pay name=pay0 pt=96"
+        )
+        try:
+            self._server = GstRtspServer.RTSPServer()
+            self._server.props.service = str(self.port)
+            self._factory = GstRtspServer.RTSPMediaFactory()
+            self._factory.set_launch(launch)
+            self._factory.set_latency(100)
+            self._factory.set_shared(True)
+
+            def on_configure(factory, media):
+                try:
+                    pipeline = media.get_element()
+                    self._appsrc = pipeline.get_by_name("mysrc")
+                    if self._appsrc:
+                        self._appsrc.set_property("stream-type", 0)
+                        self._appsrc.set_property("format", Gst.Format.TIME)
+                        self._appsrc.set_property("is-live", True)
+                        self._appsrc.set_property("do-timestamp", True)
+                except Exception as e:
+                    print(f"RTSP media-configure error: {e}")
+
+            self._factory.connect("media-configure", on_configure)
+            mounts = self._server.get_mount_points()
+            mounts.add_factory(self.mount, self._factory)
+            self._server.attach(None)
+            self._loop = GLib.MainLoop()
+            import threading
+            threading.Thread(target=self._loop.run, daemon=True).start()
+            self.is_active = True
+            print(f"RTSP streaming at rtsp://localhost:{self.port}{self.mount}")
+            return True
+        except Exception as e:
+            print(f"Failed to start RTSP server: {e}")
+            return False
+
+    def stop(self):
+        self.is_active = False
+        try:
+            if self._loop is not None:
+                self._loop.quit()
+        except Exception:
+            pass
+
+    def push_rgb_frame(self, data: bytes):
+        if not (self.is_active and _GST_AVAILABLE and self._appsrc is not None):
+            return
+        try:
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            dur = int(1e9 / max(1, self.fps))
+            buf.pts = self._pts_ns
+            buf.dts = self._pts_ns
+            buf.duration = dur
+            self._pts_ns += dur
+            self._appsrc.emit("push-buffer", buf)
+        except Exception as e:
+            print(f"RTSP push error: {e}")
+
 class AVHMI(pyglet.window.Window):
     def __init__(self, width=1280, height=720, fps=60):
         cfg = gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3)
@@ -660,7 +766,6 @@ class AVHMI(pyglet.window.Window):
         self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
 
-        # Ego + car mesh
         self.ego = Ego()
         car_obj_path = "assets/WAutoCar.obj"
         self.car_mesh: Optional[Mesh] = None
@@ -694,7 +799,7 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to load '{car_obj_path}': {e}")
 
         # Wheels
-        self.wheels = []  # list of dicts: {'mesh': Mesh, 'offset': (x,y,z), 'steer': bool, 'radius': float}
+        self.wheels = []
         whl_R_obj_path = "assets/whl/whl_R.obj"
         whl_L_obj_path = "assets/whl/whl_L.obj"
         try:
@@ -717,29 +822,29 @@ class AVHMI(pyglet.window.Window):
 
             self.wheels.append({
                 'mesh': wmesh_r,
-                'offset': (0.825, 0.35, -1.6625),  # relative to car center
-                'steer': True,                    # set False for non-steering wheels
+                'offset': (0.825, 0.35, -1.6625),
+                'steer': True, 
                 'radius': 0.35
             })
 
             self.wheels.append({
                 'mesh': wmesh_l,
-                'offset': (-0.825, 0.35, -1.6625),  # relative to car center
-                'steer': True,                    # set False for non-steering wheels
+                'offset': (-0.825, 0.35, -1.6625),
+                'steer': True, 
                 'radius': 0.35
             })
 
             self.wheels.append({
                 'mesh': wmesh_r,
-                'offset': (0.8, 0.35, 1.2225),  # relative to car center
-                'steer': False,                    # set False for non-steering wheels
+                'offset': (0.8, 0.35, 1.2225), 
+                'steer': False,
                 'radius': 0.35
             })
 
             self.wheels.append({
                 'mesh': wmesh_l,
-                'offset': (-0.8, 0.35, 1.2225),  # relative to car center
-                'steer': False,                    # set False for non-steering wheels
+                'offset': (-0.8, 0.35, 1.2225), 
+                'steer': False,
                 'radius': 0.35
             })
 
@@ -750,7 +855,7 @@ class AVHMI(pyglet.window.Window):
         self._wheel_roll = 0.0
 
         # Orange barricade
-        bl, bd = 1.8*0.85, 0.6*0.85  # 15% smaller
+        bl, bd = 1.8*0.85, 0.6*0.85
         tl, td = 1.4*0.85, 0.4*0.85
         h      = 1.0*0.85
         bx, by, bz = 3.0 + 1.2, 0.0, -10.0
@@ -759,17 +864,16 @@ class AVHMI(pyglet.window.Window):
         ]
         self.show_obstacles = True
 
-        # Characters (humans)
+        # Human Models
         self.characters: List[MovingCharacter] = []
         human_obj_path = "assets/human/human.obj"
         try:
             hpos, huv, htex = load_obj_with_uv_mtl(human_obj_path, scale=1.0, center_y=0.0)
-            # Scale the human mesh so its height matches a realistic human height
             if hpos:
                 ys = [p[1] for p in hpos]
                 ymin, ymax = min(ys), max(ys)
                 model_h = max(1e-6, ymax - ymin)
-                desired_h = 1.82  # target human height in meters (adjustable)
+                desired_h = 1.82 
                 s = desired_h / model_h
                 hpos_scaled = [(x*s, (y - ymin)*s, z*s) for (x, y, z) in hpos]
             else:
@@ -780,11 +884,9 @@ class AVHMI(pyglet.window.Window):
                 if tex_obj:
                     hmesh = Mesh(hpos_scaled, None, huv, tex_obj.id, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0), _tex_obj=tex_obj)
                 else:
-                    # fallback to colored
                     cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                     hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             else:
-                # no UV/texture: fallback colored mesh
                 cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                 hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             self.characters.append(MovingCharacter(hmesh, 2.0, 0.0, -8.0))
@@ -795,7 +897,6 @@ class AVHMI(pyglet.window.Window):
             print(f"Loaded human model: {tris} tris (scale {s:.3f} -> height {desired_h} m)")
         except Exception as e:
             print(f"WARNING: failed to load human '{human_obj_path}': {e}")
-            # fallback simple box as placeholder
             v, c = make_box_triangles(0.6, 1.8, 0.4, (0.8, 0.7, 0.6))
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
@@ -806,21 +907,19 @@ class AVHMI(pyglet.window.Window):
         try:
             sv_pos, sv_uv, sv_tex = load_obj_with_uv_mtl(surrounding_car_obj_path, scale=1.0, center_y=0.0)
 
-            # Load wheel geometry once
             whl_R_obj_path = "assets/whl/whl_R.obj"
             whl_L_obj_path = "assets/whl/whl_L.obj"
             wpos_r, wuv_r, wtex_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0)
             wpos_l, wuv_l, wtex_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
-            # Prepare wheel textures if available
             wtex_r_obj = create_texture_2d(wtex_r) if (wuv_r and wtex_r) else None
             wtex_l_obj = create_texture_2d(wtex_l) if (wuv_l and wtex_l) else None
 
             # Create surrounding vehicle at a static position
             for i in range(1):
-                lane_offset = -1.75 if i % 2 == 0 else 1.75  # Alternate lanes
-                z_pos = -20.0 - i * 15.0                      # Stagger along road
+                lane_offset = -1.75 if i % 2 == 0 else 1.75 
+                z_pos = -20.0 - i * 15.0  
 
-                # Force colored gray mesh (ignore texture)
+                # Colored gray mesh
                 cols = [(0.6, 0.6, 0.6)] * len(sv_pos)
                 sv_mesh = Mesh(sv_pos, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
 
@@ -850,7 +949,7 @@ class AVHMI(pyglet.window.Window):
                     wmesh_l_front = None
                     wmesh_l_rear  = None
 
-                # Add four wheels using same offsets as ego (no steer/roll)
+                # Add four wheels with no steer/roll
                 if wmesh_r_front and wmesh_l_front and wmesh_r_rear and wmesh_l_rear:
                     vehicle.wheels.append({'mesh': wmesh_r_front, 'offset': (0.825, 0.35, -1.6625)})
                     vehicle.wheels.append({'mesh': wmesh_l_front, 'offset': (-0.825, 0.35, -1.6625)})
@@ -863,7 +962,7 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"WARNING: failed to load surrounding vehicle geometry from '{surrounding_car_obj_path}': {e}")
 
-        # Lanes + grid (colored pipeline)
+        # Lanes + grid
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
         
         self.tile_size   = 40.0      # meters per tile
@@ -880,7 +979,7 @@ class AVHMI(pyglet.window.Window):
             stop_x, stop_y, stop_z = 3.5, 0.0, -15.0
             self.sign_stop = StreetSign('stop', stop_x, stop_y, stop_z)
             # Regular triangle 
-            scale_tri = 0.85  # reduce size by 15%
+            scale_tri = 0.85
             self.sign_regular_triangle = StreetSign('yield', stop_x + 1.4, stop_y, stop_z, scale=scale_tri)
             # Inverted triangle
             r = (0.9 * scale_tri) / math.sqrt(3.0)
@@ -898,8 +997,8 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to build street signs: {e}")
 
         gv, gc = make_grid_tile(self.tile_size, self.tile_step)
-        self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity())  # one VBO reused
-        self.grid_tiles = {}  # {(ix, iz): model_matrix}
+        self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity()) 
+        self.grid_tiles = {}
         self.lanes = [Mesh(*make_polyline(pts), None, None, gl.GL_LINES, mat4_identity()) for pts in lane_pts]
 
         # Camera (initialize behind the car)
@@ -912,8 +1011,14 @@ class AVHMI(pyglet.window.Window):
         self.last_time = time.perf_counter()
         pyglet.clock.schedule_interval(self.update, 1.0/self.fps)
 
+        # Start RTSP streaming if available
+        try:
+            self.streamer = RTSPStreamer(self.width, self.height, self.fps, port=8554, mount="/sim")
+            self.streamer.start()
+        except Exception as e:
+            print(f"RTSP init failed: {e}")
+
     def _stream_grid(self):
-        # Which tile is the ego in?
         ix = int(math.floor(self.ego.pos[0] / self.tile_size))
         iz = int(math.floor(self.ego.pos[2] / self.tile_size))
 
@@ -922,7 +1027,6 @@ class AVHMI(pyglet.window.Window):
             for j in range(iz - self.tile_radius, iz + self.tile_radius + 1):
                 needed.add((i, j))
                 if (i, j) not in self.grid_tiles:
-                    # place tile centers on a regular lattice
                     mx = i * self.tile_size
                     mz = j * self.tile_size
                     self.grid_tiles[(i, j)] = mat4_translate(mx, 0.0, mz)
@@ -1054,6 +1158,15 @@ class AVHMI(pyglet.window.Window):
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
+
+        # Capture and stream current frame via RTSP
+        try:
+            if getattr(self, 'streamer', None) and self.streamer.is_active:
+                img = pyglet.image.get_buffer_manager().get_color_buffer().get_image_data()
+                data = img.get_data('RGB', self.width * 3)
+                self.streamer.push_rgb_frame(data)
+        except Exception as e:
+            pass
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
