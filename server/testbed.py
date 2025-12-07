@@ -376,6 +376,70 @@ class Mesh:
     model: List[float]
     _tex_obj: Optional[pyglet.image.Texture] = None 
 
+def _compute_local_aabb(verts):
+    if not verts:
+        return (0,0,0),(0,0,0)
+    minx = miny = minz = float('inf')
+    maxx = maxy = maxz = float('-inf')
+    
+    # Check if verts is flat list of floats or list of tuples
+    is_flat = len(verts) > 0 and isinstance(verts[0], (int, float))
+    
+    if is_flat:
+        for i in range(0, len(verts), 3):
+            x = verts[i]
+            y = verts[i+1]
+            z = verts[i+2]
+            if x < minx: minx = x
+            if y < miny: miny = y
+            if z < minz: minz = z
+            if x > maxx: maxx = x
+            if y > maxy: maxy = y
+            if z > maxz: maxz = z
+    else:
+        for x,y,z in verts:
+            if x < minx: minx = x
+            if y < miny: miny = y
+            if z < minz: minz = z
+            if x > maxx: maxx = x
+            if y > maxy: maxy = y
+            if z > maxz: maxz = z
+            
+    return (minx,miny,minz),(maxx,maxy,maxz)
+
+def _make_wireframe_from_aabb(minv, maxv):
+    minx,miny,minz = minv
+    maxx,maxy,maxz = maxv
+    c0 = (minx,miny,minz)
+    c1 = (maxx,miny,minz)
+    c2 = (maxx,maxy,minz)
+    c3 = (minx,maxy,minz)
+    c4 = (minx,miny,maxz)
+    c5 = (maxx,miny,maxz)
+    c6 = (maxx,maxy,maxz)
+    c7 = (minx,maxy,maxz)
+    edges = [
+        (c0,c1),(c1,c5),(c5,c4),(c4,c0),
+        (c3,c2),(c2,c6),(c6,c7),(c7,c3),
+        (c0,c3),(c1,c2),(c5,c6),(c4,c7)
+    ]
+    verts = []
+    cols = []
+    for a,b in edges:
+        verts.append(a); cols.append((1.0,1.0,0.0))  # Yellow wireframe
+        verts.append(b); cols.append((1.0,1.0,0.0))
+    return verts, cols
+
+def attach_hitbox(mesh: Mesh):
+    if not mesh or not getattr(mesh, 'verts', None):
+        return
+    minv, maxv = _compute_local_aabb(mesh.verts)
+    wf_verts, wf_cols = _make_wireframe_from_aabb(minv, maxv)
+    hb = Mesh(wf_verts, wf_cols, None, None, gl.GL_LINES, mat4_identity())
+    hb._aabb_local = (minv, maxv)
+    mesh.hitbox = hb
+
+
 class Ego:
     def __init__(self):
         self.pos  = [0.0, 0.0, 0.0]
@@ -395,6 +459,13 @@ class Ego:
         # fallback colored box
         v,c = make_box_triangles(self.length, self.height, self.width, (0.1,0.8,0.3))
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_identity())
+        # Create visible outer hitbox (yellow wireframe)
+        # X-axis = width (side-to-side), Z-axis = length (front-to-back)
+        minv = (-self.width*0.5, 0.0, -self.length*0.5)
+        maxv = ( self.width*0.5, self.height,  self.length*0.5)
+        wf_verts, wf_cols = _make_wireframe_from_aabb(minv, maxv)
+        self.hitbox = Mesh(wf_verts, wf_cols, None, None, gl.GL_LINES, mat4_identity())
+        self.hitbox._aabb_local = (minv, maxv)
 
     def update(self, dt, throttle, steer_cmd, brake):
         target = clamp(steer_cmd * self.max_steer, -self.max_steer, self.max_steer)
@@ -415,6 +486,9 @@ class Ego:
         self.yaw    += (self.v / self.wb) * math.tan(self.steer) * dt
 
         self.mesh.model = mat4_mul(mat4_translate(*self.pos), mat4_rotate_y(self.yaw))
+        # Update hitbox to follow vehicle
+        if hasattr(self, 'hitbox'):
+            self.hitbox.model = mat4_mul(mat4_translate(*self.pos), mat4_rotate_y(self.yaw))
 
 class MovingBox:
     def __init__(self, x, y, z, lx, ly, lz, color=(0.9,0.2,0.2), vel=(0.0,0.0,0.0)):
@@ -428,6 +502,17 @@ class MovingBox:
         self.pos[2] += self.vz*dt
         self.mesh.model = mat4_translate(*self.pos)
 
+class Barricade:
+    def __init__(self, x, y, z):
+        # Orange color
+        color = (1.0, 0.5, 0.0)
+        # Dimensions for a barricade (approx 0.8m wide, 1.0m high, 0.2m deep)
+        lx, ly, lz = 0.8, 1.0, 0.2
+        v, c = make_box_triangles(lx, ly, lz, color)
+        self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+        self.pos = [x, y, z]
+        attach_hitbox(self.mesh)
+
 class MovingBarricade:
     """Orange work zone barricade (trapezoidal prism) that can move like MovingBox."""
     def __init__(self, x, y, z,
@@ -437,6 +522,7 @@ class MovingBarricade:
                  color=(1.0, 0.5, 0.0), vel=(0.0, 0.0, 0.0)):
         v, c = make_trapezoid_prism(base_len, base_depth, top_len, top_depth, height, color)
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x,y,z), mat4_identity()))
+        attach_hitbox(self.mesh)
         self.vx, self.vy, self.vz = vel
         self.pos = [x, y, z]
     def update(self, dt):
@@ -444,6 +530,8 @@ class MovingBarricade:
         self.pos[1] += self.vy*dt
         self.pos[2] += self.vz*dt
         self.mesh.model = mat4_translate(*self.pos)
+        if hasattr(self.mesh, 'hitbox'):
+            self.mesh.hitbox.model = self.mesh.model
 
 class MovingCharacter:
     """Simple wrapper for a character mesh with a world position.
@@ -455,6 +543,8 @@ class MovingCharacter:
 
     def update(self, dt: float):
         self.mesh.model = mat4_translate(*self.pos)
+        if hasattr(self.mesh, 'hitbox'):
+            self.mesh.hitbox.model = self.mesh.model
 
 class SurroundingVehicle:
     """Wrapper for surrounding vehicle meshes with world position (static) and wheels."""
@@ -466,6 +556,8 @@ class SurroundingVehicle:
     def update(self, dt: float):
         M = mat4_translate(*self.pos)
         self.mesh.model = M
+        if hasattr(self.mesh, 'hitbox'):
+            self.mesh.hitbox.model = M
         for w in self.wheels:
             ox, oy, oz = w['offset']
             w['mesh'].model = mat4_mul(M, mat4_translate(ox, oy, oz))
@@ -510,9 +602,12 @@ class TrafficLight:
         # Create the mesh
         self.mesh = Mesh(all_verts, all_cols, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
         self.pos = [x, y, z]
+        attach_hitbox(self.mesh)
 
     def update(self, dt: float):
         self.mesh.model = mat4_translate(*self.pos)
+        if hasattr(self.mesh, 'hitbox'):
+            self.mesh.hitbox.model = self.mesh.model
 
 # ------------------------------------------------------------
 # Street Signs
@@ -542,6 +637,8 @@ class StreetSign:
         panel_y = y + pole_h + thickness*0.5
         self.panel_offset = (0.0, pole_h + thickness*0.5 + self.y_adjust, pole_d*0.5 + thickness*0.5)
         self.panel_mesh = Mesh(sv, sc, None, None, gl.GL_TRIANGLES, mat4_identity())
+        attach_hitbox(self.pole_mesh)
+        attach_hitbox(self.panel_mesh)
 
     def update(self, dt: float):
         M = mat4_translate(*self.pos)
@@ -552,6 +649,10 @@ class StreetSign:
         if getattr(self, 'yaw', 0.0) != 0.0:
             Mp = mat4_mul(Mp, mat4_rotate_y(self.yaw))
         self.panel_mesh.model = Mp
+        if hasattr(self.pole_mesh, 'hitbox'):
+            self.pole_mesh.hitbox.model = self.pole_mesh.model
+        if hasattr(self.panel_mesh, 'hitbox'):
+            self.panel_mesh.hitbox.model = self.panel_mesh.model
 
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
@@ -564,11 +665,27 @@ class Renderer:
     def _build_gpu_color(self, mesh: Mesh):
         n = len(mesh.verts)
         inter = []
-        for i in range(n):
-            x,y,z = mesh.verts[i]
-            r,g,b = mesh.cols[i]
-            inter.extend((x,y,z, r,g,b))
-        arr = (gl.GLfloat * (6*n))(*inter)
+        # Detect if verts is flat list or list of tuples
+        is_flat = n > 0 and isinstance(mesh.verts[0], (int, float))
+        
+        if is_flat:
+            # Flat list: iterate in steps of 3
+            vertex_count = n // 3
+            for i in range(0, n, 3):
+                x = mesh.verts[i]
+                y = mesh.verts[i+1]
+                z = mesh.verts[i+2]
+                r, g, b = mesh.cols[i//3] if mesh.cols else (1.0, 1.0, 1.0)
+                inter.extend((x, y, z, r, g, b))
+        else:
+            # List of tuples
+            vertex_count = n
+            for i in range(n):
+                x, y, z = mesh.verts[i]
+                r, g, b = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
+                inter.extend((x, y, z, r, g, b))
+        
+        arr = (gl.GLfloat * (6 * vertex_count))(*inter)
 
         vao = gl.GLuint()
         vbo = gl.GLuint()
@@ -584,16 +701,55 @@ class Renderer:
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
-        mesh._gpu = (vao, vbo, n, mesh.mode, 'color')
+        mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
 
     def _build_gpu_tex(self, mesh: Mesh):
         n = len(mesh.verts)
         inter = []
-        for i in range(n):
-            x,y,z = mesh.verts[i]
-            u,v = mesh.uvs[i]
-            inter.extend((x,y,z, u,v))
-        arr = (gl.GLfloat * (5*n))(*inter)
+        # Detect if verts is flat list or list of tuples
+        is_flat = n > 0 and isinstance(mesh.verts[0], (int, float))
+        
+        # Detect if uvs is flat list or list of tuples
+        is_uv_flat = False
+        if mesh.uvs and len(mesh.uvs) > 0:
+            is_uv_flat = isinstance(mesh.uvs[0], (int, float))
+
+        if is_flat:
+            # Flat list: iterate in steps of 3
+            vertex_count = n // 3
+            for i in range(0, n, 3):
+                x = mesh.verts[i]
+                y = mesh.verts[i+1]
+                z = mesh.verts[i+2]
+                
+                idx = i // 3
+                if mesh.uvs:
+                    if is_uv_flat:
+                        u = mesh.uvs[2*idx]
+                        v = mesh.uvs[2*idx+1]
+                    else:
+                        u, v = mesh.uvs[idx]
+                else:
+                    u, v = 0.0, 0.0
+                
+                inter.extend((x, y, z, u, v))
+        else:
+            # List of tuples
+            vertex_count = n
+            for i in range(n):
+                x, y, z = mesh.verts[i]
+                if mesh.uvs:
+                    if is_uv_flat:
+                        u = mesh.uvs[2*i]
+                        v = mesh.uvs[2*i+1]
+                    else:
+                        u, v = mesh.uvs[i]
+                else:
+                    u, v = 0.0, 0.0
+                
+                inter.extend((x, y, z, u, v))
+        
+        arr = (gl.GLfloat * (5 * vertex_count))(*inter)
 
         vao = gl.GLuint()
         vbo = gl.GLuint()
@@ -609,7 +765,7 @@ class Renderer:
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
-        mesh._gpu = (vao, vbo, n, mesh.mode, 'tex')
+        mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'tex')
 
     def draw_mesh(self, mesh: Mesh, proj_view):
         if not hasattr(mesh, "_gpu"):
@@ -889,6 +1045,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                 hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            attach_hitbox(hmesh)
             self.characters.append(MovingCharacter(hmesh, 2.0, 0.0, -8.0))
             try:
                 tris = len(hpos_scaled)//3
@@ -899,6 +1056,7 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to load human '{human_obj_path}': {e}")
             v, c = make_box_triangles(0.6, 1.8, 0.4, (0.8, 0.7, 0.6))
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            attach_hitbox(fallback)
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
 
         # Surrounding vehicles
@@ -922,6 +1080,7 @@ class AVHMI(pyglet.window.Window):
                 # Colored gray mesh
                 cols = [(0.6, 0.6, 0.6)] * len(sv_pos)
                 sv_mesh = Mesh(sv_pos, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+                attach_hitbox(sv_mesh)
 
                 vehicle = SurroundingVehicle(sv_mesh, lane_offset, 0.0, z_pos)
                 # Build static wheels for this vehicle
@@ -1018,6 +1177,107 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"RTSP init failed: {e}")
 
+    def _world_aabb_from_hitbox(self, hb: Mesh):
+        """Transform hitbox AABB to world space accounting for rotation."""
+        if not getattr(hb, '_aabb_local', None):
+            return None
+        (minx,miny,minz),(maxx,maxy,maxz) = hb._aabb_local
+        # Transform all 8 corners through the model matrix
+        corners = [
+            (minx, miny, minz), (maxx, miny, minz),
+            (minx, maxy, minz), (maxx, maxy, minz),
+            (minx, miny, maxz), (maxx, miny, maxz),
+            (minx, maxy, maxz), (maxx, maxy, maxz)
+        ]
+        M = hb.model
+        world_corners = []
+        for x, y, z in corners:
+            # Apply model matrix transformation (M is column-major)
+            wx = M[0]*x + M[4]*y + M[8]*z  + M[12]
+            wy = M[1]*x + M[5]*y + M[9]*z  + M[13]
+            wz = M[2]*x + M[6]*y + M[10]*z + M[14]
+            world_corners.append((wx, wy, wz))
+        # Compute AABB from transformed corners
+        wxs, wys, wzs = zip(*world_corners)
+        return (min(wxs), min(wys), min(wzs)), (max(wxs), max(wys), max(wzs))
+
+    def _ego_aabb(self, pos):
+        """Get ego vehicle AABB in world space."""
+        if getattr(self.ego, 'hitbox', None):
+            res = self._world_aabb_from_hitbox(self.ego.hitbox)
+            if res:
+                return res
+        # Fallback to simple AABB
+        x,y,z = pos
+        lx, ly, lz = self.ego.length, self.ego.height, self.ego.width
+        return (x - lx*0.5, y + 0.0, z - lz*0.5), (x + lx*0.5, y + ly, z + lz*0.5)
+
+    def _aabb_overlap(self, amin, amax, bmin, bmax):
+        """Check if two AABBs overlap."""
+        if amax[0] < bmin[0] or amin[0] > bmax[0]:
+            return False
+        if amax[1] < bmin[1] or amin[1] > bmax[1]:
+            return False
+        if amax[2] < bmin[2] or amin[2] > bmax[2]:
+            return False
+        return True
+
+    def _check_ego_collision(self):
+        """Check if ego vehicle collides with any scene objects."""
+        emin, emax = self._ego_aabb(self.ego.pos)
+        
+        # Check obstacles (barricades)
+        if getattr(self, 'show_obstacles', False):
+            for o in getattr(self, 'obstacles', []):
+                if hasattr(o.mesh, 'hitbox') and o.mesh.hitbox:
+                    wb = o.mesh.hitbox
+                    res = self._world_aabb_from_hitbox(wb)
+                    if res:
+                        bmin, bmax = res
+                        if self._aabb_overlap(emin, emax, bmin, bmax):
+                            return True
+        
+        # Check characters (humans)
+        for ch in getattr(self, 'characters', []):
+            if hasattr(ch.mesh, 'hitbox') and ch.mesh.hitbox:
+                wb = ch.mesh.hitbox
+                res = self._world_aabb_from_hitbox(wb)
+                if res:
+                    bmin, bmax = res
+                    if self._aabb_overlap(emin, emax, bmin, bmax):
+                        return True
+        
+        # Check surrounding vehicles
+        for v in getattr(self, 'surrounding_vehicles', []):
+            if hasattr(v.mesh, 'hitbox') and v.mesh.hitbox:
+                wb = v.mesh.hitbox
+                res = self._world_aabb_from_hitbox(wb)
+                if res:
+                    bmin, bmax = res
+                    if self._aabb_overlap(emin, emax, bmin, bmax):
+                        return True
+        
+        # Check street sign poles only (panels are small and can cause issues)
+        for ss in getattr(self, 'street_signs', []):
+            if hasattr(ss.pole_mesh, 'hitbox') and ss.pole_mesh.hitbox:
+                wb = ss.pole_mesh.hitbox
+                res = self._world_aabb_from_hitbox(wb)
+                if res:
+                    bmin, bmax = res
+                    if self._aabb_overlap(emin, emax, bmin, bmax):
+                        return True
+        
+        # Check traffic light
+        if hasattr(self.traffic_light.mesh, 'hitbox') and self.traffic_light.mesh.hitbox:
+            wb = self.traffic_light.mesh.hitbox
+            res = self._world_aabb_from_hitbox(wb)
+            if res:
+                bmin, bmax = res
+                if self._aabb_overlap(emin, emax, bmin, bmax):
+                    return True
+        
+        return False
+
     def _stream_grid(self):
         ix = int(math.floor(self.ego.pos[0] / self.tile_size))
         iz = int(math.floor(self.ego.pos[2] / self.tile_size))
@@ -1063,6 +1323,9 @@ class AVHMI(pyglet.window.Window):
         steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
         self.brake_on = brake > 0.1
 
+        # Store old position for collision rollback
+        old_pos = list(self.ego.pos)
+        
         self.ego.update(dt, throttle, steer_cmd, brake)
         for w in self.wheels:
             r = max(1e-6, w['radius'])
@@ -1081,6 +1344,16 @@ class AVHMI(pyglet.window.Window):
         # update street signs
         for ss in self.street_signs:
             ss.update(dt)
+        # update traffic light
+        self.traffic_light.update(dt)
+
+        # Check for collisions and rollback if needed
+        if self._check_ego_collision():
+            self.ego.pos = old_pos
+            self.ego.v = 0.0
+            self.ego.mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
+            if hasattr(self.ego, 'hitbox'):
+                self.ego.hitbox.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
 
     # Draw
     def on_draw(self):
@@ -1088,8 +1361,20 @@ class AVHMI(pyglet.window.Window):
 
         proj = perspective(60.0, max(1e-6, self.width/float(self.height)), 0.1, 500.0)
 
-        # Camera (mouse-only orbit, not tied to ego yaw)
-        tx, ty, tz = self.ego.pos[0], self.ego.pos[1] + 0.8, self.ego.pos[2]
+        # Camera mount point
+        cam_mount_local_x = 0.0  # centered laterally
+        cam_mount_local_y = 1.65  # on top of windshield
+        cam_mount_local_z = -0.5  # forward from center (negative Z is forward)
+        
+        # Transform camera mount to world space based on vehicle rotation
+        c = math.cos(self.ego.yaw)
+        s = math.sin(self.ego.yaw)
+        cam_mount_world_x = self.ego.pos[0] + (c * cam_mount_local_x - s * cam_mount_local_z)
+        cam_mount_world_y = self.ego.pos[1] + cam_mount_local_y
+        cam_mount_world_z = self.ego.pos[2] + (s * cam_mount_local_x + c * cam_mount_local_z)
+        
+        # Camera orbits around the windshield mount point
+        tx, ty, tz = cam_mount_world_x, cam_mount_world_y, cam_mount_world_z
         yaw = self.cam_yawoff
         cx = tx - math.cos(yaw) * self.cam_dist
         cy = ty + self.cam_height * math.sin(self.cam_pitch)
@@ -1120,6 +1405,12 @@ class AVHMI(pyglet.window.Window):
         else:
             self.ego.mesh.model = car_M
             self.renderer.draw_mesh(self.ego.mesh, pv)
+        
+        # Draw vehicle hitbox (yellow wireframe)
+        if hasattr(self.ego, 'hitbox'):
+            gl.glDisable(gl.GL_DEPTH_TEST)
+            self.renderer.draw_mesh(self.ego.hitbox, pv)
+            gl.glEnable(gl.GL_DEPTH_TEST)
 
         # Wheels
         steer_angle = self.ego.steer if self.wheels and self.wheels[0]['steer'] else 0.0
@@ -1137,22 +1428,46 @@ class AVHMI(pyglet.window.Window):
         if getattr(self, 'show_obstacles', False):
             for o in self.obstacles:
                 self.renderer.draw_mesh(o.mesh, pv)
+                if hasattr(o.mesh, 'hitbox'):
+                    gl.glDisable(gl.GL_DEPTH_TEST)
+                    self.renderer.draw_mesh(o.mesh.hitbox, pv)
+                    gl.glEnable(gl.GL_DEPTH_TEST)
 
-        # Draw traffic light
+        # Draw traffic light and its hitbox
         self.renderer.draw_mesh(self.traffic_light.mesh, pv)
+        if hasattr(self.traffic_light.mesh, 'hitbox'):
+            gl.glDisable(gl.GL_DEPTH_TEST)
+            self.renderer.draw_mesh(self.traffic_light.mesh.hitbox, pv)
+            gl.glEnable(gl.GL_DEPTH_TEST)
 
-        # Draw street signs
+        # Draw street signs and their hitboxes
         for ss in self.street_signs:
             self.renderer.draw_mesh(ss.pole_mesh, pv)
+            if hasattr(ss.pole_mesh, 'hitbox'):
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                self.renderer.draw_mesh(ss.pole_mesh.hitbox, pv)
+                gl.glEnable(gl.GL_DEPTH_TEST)
             self.renderer.draw_mesh(ss.panel_mesh, pv)
+            if hasattr(ss.panel_mesh, 'hitbox'):
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                self.renderer.draw_mesh(ss.panel_mesh.hitbox, pv)
+                gl.glEnable(gl.GL_DEPTH_TEST)
 
-        # Draw characters
+        # Draw characters and their hitboxes
         for ch in self.characters:
             self.renderer.draw_mesh(ch.mesh, pv)
+            if hasattr(ch.mesh, 'hitbox'):
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                self.renderer.draw_mesh(ch.mesh.hitbox, pv)
+                gl.glEnable(gl.GL_DEPTH_TEST)
 
-        # Draw surrounding vehicles
+        # Draw surrounding vehicles and their hitboxes
         for vehicle in self.surrounding_vehicles:
             self.renderer.draw_mesh(vehicle.mesh, pv)
+            if hasattr(vehicle.mesh, 'hitbox'):
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                self.renderer.draw_mesh(vehicle.mesh.hitbox, pv)
+                gl.glEnable(gl.GL_DEPTH_TEST)
             for w in vehicle.wheels:
                 self.renderer.draw_mesh(w['mesh'], pv)
 
