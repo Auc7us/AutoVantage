@@ -1,5 +1,15 @@
 # WAutoVantage: Real-Time visualization for autonomous vehicle scene understanding 
 
+## Latest - How to Run Testbed.py for Autonomous Simulation
+
+Run these commands:
+```bash
+    python -m venv .wav
+    .wav/Scripts/activate
+    pip install pyglet
+    python server/testbed.py
+```
+
 ## Overview
 
 This repository contains a real-time web application that combines [WebTransport](https://github.com/aiortc/aioquic) (via `aioquic`) for low-latency bidirectional data communication and [WebRTC](https://github.com/aiortc/aiortc) (via `aiortc`) for real-time video streaming.
