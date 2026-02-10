@@ -15,6 +15,16 @@ from testbed import (
     MovingBox, SurroundingVehicle, Barricade
 )
 
+def ortho(left, right, bottom, top, znear, zfar):
+    """Orthographic projection matrix"""
+    rl = 1.0 / (right - left)
+    tb = 1.0 / (top - bottom)
+    fn = 1.0 / (zfar - znear)
+    return [2*rl,     0,      0,  -(right+left)*rl,
+            0,     2*tb,      0,  -(top+bottom)*tb,
+            0,        0,  -2*fn,  -(zfar+znear)*fn,
+            0,        0,      0,                  1]
+
 class VideoSimulation(pyglet.window.Window):
     """
     3D simulation that mimics the camera video feed.
@@ -45,7 +55,7 @@ class VideoSimulation(pyglet.window.Window):
 
         # Data loading (paths relative to script location)
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Go up one level from server/ to root, then into data/dataset/
+        # Go up one level from server/ to root, then into assets/data/
         root_dir = os.path.dirname(script_dir)
         dataset_dir = os.path.join(root_dir, "data", "dataset")
         
@@ -155,7 +165,7 @@ class VideoSimulation(pyglet.window.Window):
             except Exception as e:
                 print(f"Error loading CSV: {e}")
 
-        # 4. Load Barricade Detections
+        # 4. Load Barricade Detections (optional)
         if os.path.exists(self.csv_barricade_path):
             try:
                 with open(self.csv_barricade_path, 'r', newline='') as f:
@@ -172,6 +182,8 @@ class VideoSimulation(pyglet.window.Window):
                 print(f"Loaded barricade detections for {len(self.detections_barricade)} frames")
             except Exception as e:
                 print(f"Error loading Barricade CSV: {e}")
+        else:
+            print(f"Barricade CSV not found at {self.csv_barricade_path}")
 
     def _create_background_quad(self):
         # Create a full-screen quad for the video background
@@ -352,13 +364,15 @@ class VideoSimulation(pyglet.window.Window):
     def on_draw(self):
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
-        # 1. Draw Background (Video Frame)
+        # 1. Draw Background (Video Frame) using orthographic projection
         gl.glDisable(gl.GL_DEPTH_TEST)
         if self.current_frame_tex is not None:
-            self.renderer.draw_mesh(self.bg_mesh, mat4_identity())
+            # Orthographic projection for screen-aligned quad
+            ortho_proj = ortho(-1, 1, -1, 1, -1, 1)
+            self.renderer.draw_mesh(self.bg_mesh, ortho_proj)
         gl.glEnable(gl.GL_DEPTH_TEST)
 
-        # 2. Draw 3D Scene
+        # 2. Draw 3D Scene (Traffic Lights, Barricades) with perspective
         # Camera setup: We want to match the video perspective.
         proj = perspective(60.0, max(1e-6, self.width/float(self.height)), 0.1, 500.0)
         

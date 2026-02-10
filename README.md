@@ -4,10 +4,20 @@
 
 Run these commands:
 ```bash
-    python -m venv .wav
-    .wav/Scripts/activate
-    pip install pyglet
-    python server/testbed.py
+python -m venv .wav
+.wav/Scripts/activate
+pip install pyglet
+python server/testbed.py
+```
+
+## How to Run Videosimulation.py for Video Simulation
+
+Run these commands:
+```bash
+python -m venv .wav
+.wav/Scripts/activate
+pip install opencv-python
+python server/videosimulation.py
 ```
 
 ## Overview
