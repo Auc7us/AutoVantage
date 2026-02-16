@@ -22,23 +22,32 @@ except Exception:
 # ------------------------------------------------------------
 # Minimal MTL parser (grabs first map_Kd path)
 # ------------------------------------------------------------
-def parse_mtl_for_diffuse_texture(mtl_path: str) -> Optional[str]:
+def parse_mtl(mtl_path: str):
     if not os.path.isfile(mtl_path):
-        return None
-    tex = None
+        return None, {}
+    first_tex = None
+    colors = {}
+    current_mtl = None
     with open(mtl_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            if line.lstrip().lower().startswith('map_kd'):
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) == 2:
-                    candidate = parts[1].strip().strip('"')
-                    tex = candidate
-                    break
-    if tex:
-        # Resolve relative to MTL directory
-        if not os.path.isabs(tex):
-            tex = os.path.join(os.path.dirname(mtl_path), tex)
-    return tex if os.path.isfile(tex) else None
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            parts = line.split()
+            if not parts: continue
+            tag = parts[0].lower()
+            if tag == 'newmtl' and len(parts) >= 2:
+                current_mtl = parts[1]
+            elif tag == 'kd' and len(parts) >= 4 and current_mtl:
+                try:
+                    colors[current_mtl] = (float(parts[1]), float(parts[2]), float(parts[3]))
+                except: pass
+            elif tag == 'map_kd' and len(parts) >= 2:
+                tex = parts[1].strip('"')
+                if not os.path.isabs(tex):
+                    tex = os.path.join(os.path.dirname(mtl_path), tex)
+                if os.path.isfile(tex):
+                    if first_tex is None: first_tex = tex
+    return first_tex, colors
 
 def make_grid_tile(size=40.0, step=2.0, color=(0.25, 0.25, 0.25)):
     # Bounded square grid centered at origin
@@ -61,73 +70,78 @@ def make_grid_tile(size=40.0, step=2.0, color=(0.25, 0.25, 0.25)):
 def load_obj_with_uv_mtl(obj_path: str, scale=1.0, center_y=0.0):
     v_list: List[Tuple[float,float,float]] = []
     vt_list: List[Tuple[float,float]] = []
-    faces_v_idx: List[Tuple[int,int,int]] = []
-    faces_vt_idx: List[Tuple[Optional[int],Optional[int],Optional[int]]] = []
+    faces_v_idx = []
+    faces_vt_idx = []
+    faces_mtl = []
     mtl_file = None
+    current_mtl = None
+
+    if not os.path.isfile(obj_path):
+        print(f"ERROR: OBJ file not found: {obj_path}")
+        return [], None, None, None
 
     with open(obj_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             if not line or line.startswith('#'): 
                 continue
-            parts = line.strip().split()
+            parts = line.split()
             if not parts: 
                 continue
             tag = parts[0].lower()
             if tag == 'mtllib' and len(parts) >= 2:
                 mtl_file = parts[1]
+            elif tag == 'usemtl' and len(parts) >= 2:
+                current_mtl = parts[1]
             elif tag == 'v' and len(parts) >= 4:
-                x, y, z = map(float, parts[1:4])
-                v_list.append((x*scale, y*scale + center_y, z*scale))
+                v_list.append((float(parts[1])*scale, float(parts[2])*scale + center_y, float(parts[3])*scale))
             elif tag == 'vt' and len(parts) >= 3:
-                u, v = map(float, parts[1:3])
-                vt_list.append((u, v))
+                vt_list.append((float(parts[1]), float(parts[2])))
             elif tag == 'f' and len(parts) >= 4:
                 idx_v = []
                 idx_vt = []
                 for p in parts[1:]:
                     chunks = p.split('/')
-                    # v / vt / vn → chunks[0], chunks[1], chunks[2]
                     v_i  = int(chunks[0]) - 1 if chunks[0] else None
                     vt_i = int(chunks[1]) - 1 if len(chunks) > 1 and chunks[1] else None
                     idx_v.append(v_i)
                     idx_vt.append(vt_i)
-                # triangulate (fan)
                 for k in range(1, len(idx_v)-1):
                     faces_v_idx.append((idx_v[0], idx_v[k], idx_v[k+1]))
                     faces_vt_idx.append((idx_vt[0], idx_vt[k], idx_vt[k+1]))
+                    faces_mtl.append(current_mtl)
 
-    # Build triangle arrays
-    tri_pos: List[Tuple[float,float,float]] = []
-    tri_uv:  List[Tuple[float,float]] = []
+    tex_path, mtl_colors = None, {}
+    if mtl_file:
+        mtl_path = os.path.join(os.path.dirname(obj_path), mtl_file) if not os.path.isabs(mtl_file) else mtl_file
+        if not os.path.isfile(mtl_path):
+            dir_files = os.listdir(os.path.dirname(obj_path))
+            mtl_files = [f for f in dir_files if f.lower().endswith('.mtl')]
+            if mtl_files:
+                mtl_path = os.path.join(os.path.dirname(obj_path), mtl_files[0])
+        
+        tex_path, mtl_colors = parse_mtl(mtl_path)
+
+    tri_pos = []
+    tri_uv = []
+    tri_col = []
+    
     have_uv = len(vt_list) > 0 and any(any(i is not None for i in trip) for trip in faces_vt_idx)
+    have_col = len(mtl_colors) > 0
 
-    for (a,b,c), (ta,tb,tc) in zip(faces_v_idx, faces_vt_idx):
+    for (a,b,c), (ta,tb,tc), mtl in zip(faces_v_idx, faces_vt_idx, faces_mtl):
         tri_pos.extend([v_list[a], v_list[b], v_list[c]])
         if have_uv:
-            # Missing vt index? put 0,0
-            uva = vt_list[ta] if (ta is not None and 0 <= ta < len(vt_list)) else (0.0, 0.0)
-            uvb = vt_list[tb] if (tb is not None and 0 <= tb < len(vt_list)) else (0.0, 0.0)
-            uvc = vt_list[tc] if (tc is not None and 0 <= tc < len(vt_list)) else (0.0, 0.0)
-            tri_uv.extend([uva, uvb, uvc])
+            tri_uv.extend([
+                vt_list[ta] if (ta is not None and 0 <= ta < len(vt_list)) else (0.0, 0.0),
+                vt_list[tb] if (tb is not None and 0 <= tb < len(vt_list)) else (0.0, 0.0),
+                vt_list[tc] if (tc is not None and 0 <= tc < len(vt_list)) else (0.0, 0.0)
+            ])
+        if have_col:
+            col = mtl_colors.get(mtl, (0.8, 0.8, 0.8))
+            tri_col.extend([col, col, col])
 
-    # Print bounds
-    if v_list:
-        xs, ys, zs = zip(*v_list)
-        print(f"OBJ bounds: X[{min(xs):.3f},{max(xs):.3f}]  "
-              f"Y[{min(ys):.3f},{max(ys):.3f}]  Z[{min(zs):.3f},{max(zs):.3f}]")
-        print(f"Approx size (m): {(max(xs)-min(xs)):.3f} x {(max(ys)-min(ys)):.3f} x {(max(zs)-min(zs)):.3f}")
+    return tri_pos, (tri_uv if have_uv else None), tex_path, (tri_col if have_col else None)
 
-    # MTL → texture path
-    tex_path = None
-    if mtl_file:
-        # Resolve mtl relative to obj
-        if not os.path.isabs(mtl_file):
-            mtl_path = os.path.join(os.path.dirname(obj_path), mtl_file)
-        else:
-            mtl_path = mtl_file
-        tex_path = parse_mtl_for_diffuse_texture(mtl_path)
-
-    return tri_pos, (tri_uv if have_uv else None), tex_path
 
 # ------------------------------------------------------------
 # Math utils
@@ -456,20 +470,6 @@ class MovingCharacter:
     def update(self, dt: float):
         self.mesh.model = mat4_translate(*self.pos)
 
-class SurroundingVehicle:
-    """Wrapper for surrounding vehicle meshes with world position (static) and wheels."""
-    def __init__(self, mesh: Mesh, x: float = 0.0, y: float = 0.0, z: float = 0.0):
-        self.mesh = mesh
-        self.pos = [x, y, z]
-        self.wheels: List[dict] = []
-
-    def update(self, dt: float):
-        M = mat4_translate(*self.pos)
-        self.mesh.model = M
-        for w in self.wheels:
-            ox, oy, oz = w['offset']
-            w['mesh'].model = mat4_mul(M, mat4_translate(ox, oy, oz))
-
 # ------------------------------------------------------------
 # Traffic Light
 # ------------------------------------------------------------
@@ -566,7 +566,10 @@ class Renderer:
         inter = []
         for i in range(n):
             x,y,z = mesh.verts[i]
-            r,g,b = mesh.cols[i]
+            if mesh.cols and i < len(mesh.cols):
+                r,g,b = mesh.cols[i]
+            else:
+                r,g,b = (0.5, 0.5, 0.5)
             inter.extend((x,y,z, r,g,b))
         arr = (gl.GLfloat * (6*n))(*inter)
 
@@ -754,7 +757,7 @@ class RTSPStreamer:
 class AVHMI(pyglet.window.Window):
     def __init__(self, width=1280, height=720, fps=60):
         cfg = gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3)
-        super().__init__(width=width, height=height, caption="AV HMI 3D", resizable=True, config=cfg)
+        super().__init__(width=width, height=height, caption="HMI 3D", resizable=True, config=cfg)
         self.fps = fps
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDisable(gl.GL_CULL_FACE)
@@ -772,12 +775,12 @@ class AVHMI(pyglet.window.Window):
         self.tex_normal = None
         self.tex_brake = None
         try:
-            tri_pos, tri_uv, tex_path = load_obj_with_uv_mtl(car_obj_path, scale= 1.0, center_y=0.0)
+            tri_pos, tri_uv, tex_path, tri_col = load_obj_with_uv_mtl(car_obj_path, scale= 1.0, center_y=0.0)
             if tri_uv and tex_path:
                 self.tex_normal = create_texture_2d(tex_path)
                 if self.tex_normal:
                     self.car_mesh = Mesh(
-                        tri_pos, None, tri_uv, self.tex_normal.id, gl.GL_TRIANGLES,
+                        tri_pos, tri_col, tri_uv, self.tex_normal.id, gl.GL_TRIANGLES,
                         mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw)),
                         _tex_obj=self.tex_normal,
                     )
@@ -791,7 +794,7 @@ class AVHMI(pyglet.window.Window):
                     print("No _brake texture found, using default")
             if self.car_mesh is None:
                 color = (0.12, 0.75, 0.90)
-                cols  = [color] * len(tri_pos)
+                cols  = tri_col if tri_col else [color] * len(tri_pos)
                 self.car_mesh = Mesh(tri_pos, cols, None, None, gl.GL_TRIANGLES,
                                      mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw)))
                 print(f"Loaded car (no texture): {len(tri_pos)//3} tris")
@@ -803,21 +806,21 @@ class AVHMI(pyglet.window.Window):
         whl_R_obj_path = "assets/whl/whl_R.obj"
         whl_L_obj_path = "assets/whl/whl_L.obj"
         try:
-            wpos_r, wuv_r, wtex_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0) 
-            wpos_l, wuv_l, wtex_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
+            wpos_r, wuv_r, wtex_r, wcol_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0) 
+            wpos_l, wuv_l, wtex_l, wcol_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
             
             if wuv_r and wtex_r:
                 wtex_r_obj = create_texture_2d(wtex_r)
-                wmesh_r = Mesh(wpos_r, None, wuv_r, (wtex_r_obj.id if wtex_r_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
+                wmesh_r = Mesh(wpos_r, wcol_r, wuv_r, (wtex_r_obj.id if wtex_r_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
             else:
-                wcols = [(0.15, 0.15, 0.15)] * len(wpos_r)
+                wcols = wcol_r if wcol_r else [(0.15, 0.15, 0.15)] * len(wpos_r)
                 wmesh_r = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
 
             if wuv_l and wtex_l:
                 wtex_l_obj = create_texture_2d(wtex_l)
-                wmesh_l = Mesh(wpos_l, None, wuv_l, (wtex_l_obj.id if wtex_l_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
+                wmesh_l = Mesh(wpos_l, wcol_l, wuv_l, (wtex_l_obj.id if wtex_l_obj else None), gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
             else:
-                wcols = [(0.15, 0.15, 0.15)] * len(wpos_l)
+                wcols = wcol_l if wcol_l else [(0.15, 0.15, 0.15)] * len(wpos_l)
                 wmesh_l = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
 
             self.wheels.append({
@@ -860,7 +863,8 @@ class AVHMI(pyglet.window.Window):
         h      = 1.0*0.85
         bx, by, bz = 3.0 + 1.2, 0.0, -10.0
         self.obstacles: List[MovingBarricade] = [
-            MovingBarricade(bx, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(1.0, 0.5, 0.0))
+            MovingBarricade(bx, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(1.0, 0.5, 0.0)),
+            MovingBarricade(bx + 2.0, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(0.6, 0.6, 0.6))
         ]
         self.show_obstacles = True
 
@@ -868,7 +872,7 @@ class AVHMI(pyglet.window.Window):
         self.characters: List[MovingCharacter] = []
         human_obj_path = "assets/human/human.obj"
         try:
-            hpos, huv, htex = load_obj_with_uv_mtl(human_obj_path, scale=1.0, center_y=0.0)
+            hpos, huv, htex, hcol = load_obj_with_uv_mtl(human_obj_path, scale=1.0, center_y=0.0)
             if hpos:
                 ys = [p[1] for p in hpos]
                 ymin, ymax = min(ys), max(ys)
@@ -882,14 +886,14 @@ class AVHMI(pyglet.window.Window):
             if huv and htex:
                 tex_obj = create_texture_2d(htex)
                 if tex_obj:
-                    hmesh = Mesh(hpos_scaled, None, huv, tex_obj.id, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0), _tex_obj=tex_obj)
+                    hmesh = Mesh(hpos_scaled, hcol, huv, tex_obj.id, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0), _tex_obj=tex_obj)
                 else:
-                    cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
+                    cols = hcol if hcol else [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                     hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             else:
-                cols = [(0.8, 0.7, 0.6)] * len(hpos_scaled)
+                cols = hcol if hcol else [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                 hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
-            self.characters.append(MovingCharacter(hmesh, 2.0, 0.0, -8.0))
+            self.characters.append(MovingCharacter(hmesh, 3.0, 0.0, -8.0))
             try:
                 tris = len(hpos_scaled)//3
             except Exception:
@@ -901,66 +905,330 @@ class AVHMI(pyglet.window.Window):
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
 
-        # Surrounding vehicles
-        self.surrounding_vehicles: List[SurroundingVehicle] = []
-        surrounding_car_obj_path = "assets/WAutoCar.obj"
+        # Deer Model
         try:
-            sv_pos, sv_uv, sv_tex = load_obj_with_uv_mtl(surrounding_car_obj_path, scale=1.0, center_y=0.0)
+            deer_obj_path = "assets/deer/deer.obj"
+            dpos, duv, dtex, dcol = [], None, None, None
+            try:
+                dpos, duv, dtex, dcol = load_obj_with_uv_mtl(deer_obj_path, scale=1.0, center_y=0.0)
+            except Exception as _e:
+                print(f"WARNING: failed to parse deer OBJ '{deer_obj_path}': {_e}")
 
-            whl_R_obj_path = "assets/whl/whl_R.obj"
-            whl_L_obj_path = "assets/whl/whl_L.obj"
-            wpos_r, wuv_r, wtex_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0)
-            wpos_l, wuv_l, wtex_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
-            wtex_r_obj = create_texture_2d(wtex_r) if (wuv_r and wtex_r) else None
-            wtex_l_obj = create_texture_2d(wtex_l) if (wuv_l and wtex_l) else None
+            if dpos:
+                dys = [p[1] for p in dpos]
+                dymin, dymax = min(dys), max(dys)
+                model_h = max(1e-6, dymax - dymin)
+                desired_h = 2
+                s = desired_h / model_h
+                dpos_scaled = [(x*s, (y - dymin)*s, z*s) for (x, y, z) in dpos]
+            else:
+                dpos_scaled = dpos
 
-            # Create surrounding vehicle at a static position
-            for i in range(1):
-                lane_offset = -1.75 if i % 2 == 0 else 1.75 
-                z_pos = -20.0 - i * 15.0  
-
-                # Colored gray mesh
-                cols = [(0.6, 0.6, 0.6)] * len(sv_pos)
-                sv_mesh = Mesh(sv_pos, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
-
-                vehicle = SurroundingVehicle(sv_mesh, lane_offset, 0.0, z_pos)
-                # Build static wheels for this vehicle
-                if wpos_r:
-                    if wuv_r and wtex_r_obj:
-                        wmesh_r_front = Mesh(wpos_r, None, wuv_r, wtex_r_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
-                        wmesh_r_rear  = Mesh(wpos_r, None, wuv_r, wtex_r_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_r_obj)
-                    else:
-                        wcols = [(0.15, 0.15, 0.15)] * len(wpos_r)
-                        wmesh_r_front = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
-                        wmesh_r_rear  = Mesh(wpos_r, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
-                else:
-                    wmesh_r_front = None
-                    wmesh_r_rear  = None
-
-                if wpos_l:
-                    if wuv_l and wtex_l_obj:
-                        wmesh_l_front = Mesh(wpos_l, None, wuv_l, wtex_l_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
-                        wmesh_l_rear  = Mesh(wpos_l, None, wuv_l, wtex_l_obj.id, gl.GL_TRIANGLES, mat4_identity(), _tex_obj=wtex_l_obj)
-                    else:
-                        wcols = [(0.15, 0.15, 0.15)] * len(wpos_l)
-                        wmesh_l_front = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
-                        wmesh_l_rear  = Mesh(wpos_l, wcols, None, None, gl.GL_TRIANGLES, mat4_identity())
-                else:
-                    wmesh_l_front = None
-                    wmesh_l_rear  = None
-
-                # Add four wheels with no steer/roll
-                if wmesh_r_front and wmesh_l_front and wmesh_r_rear and wmesh_l_rear:
-                    vehicle.wheels.append({'mesh': wmesh_r_front, 'offset': (0.825, 0.35, -1.6625)})
-                    vehicle.wheels.append({'mesh': wmesh_l_front, 'offset': (-0.825, 0.35, -1.6625)})
-                    vehicle.wheels.append({'mesh': wmesh_r_rear,  'offset': (0.8,   0.35,  1.2225)})
-                    vehicle.wheels.append({'mesh': wmesh_l_rear,  'offset': (-0.8,  0.35,  1.2225)})
-
-                self.surrounding_vehicles.append(vehicle)
-
-            print(f"Loaded {len(self.surrounding_vehicles)} surrounding vehicles")
+            deer_mesh = None
+            if duv and dtex:
+                dtex_obj = create_texture_2d(dtex)
+                if dtex_obj:
+                    deer_mesh = Mesh(dpos_scaled, dcol, duv, dtex_obj.id, gl.GL_TRIANGLES, mat4_translate(10.0, 0.0, -8.0), _tex_obj=dtex_obj)
+            
+            if deer_mesh is None and dpos_scaled:
+                cols = dcol if dcol else [(0.60, 0.45, 0.30)] * len(dpos_scaled)
+                deer_mesh = Mesh(dpos_scaled, cols, duv, None, gl.GL_TRIANGLES, mat4_translate(10.0, 0.0, -8.0))
+            
+            if deer_mesh:
+                self.characters.append(MovingCharacter(deer_mesh, 10.0, 0.0, -8.0))
+                try:
+                    tris = len(dpos_scaled)//3
+                except Exception:
+                    tris = 0
+                print(f"Loaded deer model from '{deer_obj_path}': {tris} tris (scale {s:.3f} -> height {desired_h} m) at (10.0, -8.0)")
+            else:
+                v, c = make_box_triangles(1.2, 0.8, 0.4, (0.6, 0.4, 0.2))
+                fb = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(10.0, 0.0, -8.0))
+                self.characters.append(MovingCharacter(fb, 10.0, 0.0, -8.0))
+                print("Deer OBJ present but failed to build mesh — added fallback box at x=10.0")
         except Exception as e:
-            print(f"WARNING: failed to load surrounding vehicle geometry from '{surrounding_car_obj_path}': {e}")
+            print(f"WARNING: failed to create deer actor: {e}")
+
+        # Bike
+        try:
+            bike_obj_path = "assets/bike/bike.obj"
+            bkpos, bkuv, bktex, bkcol = None, None, None, None
+            try:
+                bkpos, bkuv, bktex, bkcol = load_obj_with_uv_mtl(bike_obj_path, scale=1.0, center_y=0.0)
+            except Exception as load_err:
+                print(f"DEBUG: Failed to load bike OBJ: {load_err}")
+                bkpos = None
+
+            if bkpos:
+                bkxs = [p[0] for p in bkpos]
+                bkys = [p[1] for p in bkpos]
+                bkzs = [p[2] for p in bkpos]
+                bkxmin, bkxmax = min(bkxs), max(bkxs)
+                bkymin, bkymax = min(bkys), max(bkys)
+                bkzmin, bkzmax = min(bkzs), max(bkzs)
+                
+                model_h = max(1e-6, bkymax - bkymin)
+                desired_h = 1.0  # 1 meter
+                s = desired_h / model_h
+                
+                cx = (bkxmin + bkxmax) * 0.5
+                cz = (bkzmin + bkzmax) * 0.5
+                
+                bkpos_scaled = [((x - cx)*s, (y - bkymin)*s, (z - cz)*s) for (x, y, z) in bkpos]
+
+                bike_x, bike_y, bike_z = 12.0, 0.0, -8.0
+
+                if bkuv and bktex and os.path.isfile(bktex):
+                    bktex_obj = create_texture_2d(bktex)
+                    bike_mesh = Mesh(bkpos_scaled, bkcol, bkuv, (bktex_obj.id if bktex_obj else None), gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z), _tex_obj=(bktex_obj if bktex_obj else None))
+                else:
+                    if bkcol:
+                        bike_mesh = Mesh(bkpos_scaled, bkcol, bkuv, None, gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z))
+                    else:
+                        fallback_cols = [(0.3, 0.3, 0.3)] * len(bkpos_scaled) # Grey fallback
+                        bike_mesh = Mesh(bkpos_scaled, fallback_cols, bkuv, None, gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z))
+
+                self.characters.append(MovingCharacter(bike_mesh, bike_x, bike_y, bike_z))
+                bktris = len(bkpos_scaled)//3
+                print(f"Loaded bike model from '{bike_obj_path}': {bktris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({bike_x}, {bike_y}, {bike_z})")
+        except Exception as e:
+            print(f"WARNING: failed to create bike actor: {e}")
+
+        # Bus
+        try:
+            bus_obj_path = "assets/bus/bus.obj"
+            bus_pos, bus_uv, bus_tex, bus_col = None, None, None, None
+            try:
+                bus_pos, bus_uv, bus_tex, bus_col = load_obj_with_uv_mtl(bus_obj_path, scale=1.0, center_y=0.0)
+            except Exception as load_err:
+                print(f"DEBUG: Failed to load bus OBJ: {load_err}")
+                bus_pos = None
+
+            if bus_pos:
+                bxs = [p[0] for p in bus_pos]
+                bys = [p[1] for p in bus_pos]
+                bzs = [p[2] for p in bus_pos]
+                bxmin, bxmax = min(bxs), max(bxs)
+                bymin, bymax = min(bys), max(bys)
+                bzmin, bzmax = min(bzs), max(bzs)
+                
+                model_h = max(1e-6, bymax - bymin)
+                desired_h = 3.0 # Bus height
+                s = desired_h / model_h
+                
+                # Center
+                cx = (bxmin + bxmax) * 0.5
+                cz = (bzmin + bzmax) * 0.5
+                
+                # Scale, Center, and Rotate 90 degrees left (around Y)
+                # Rotation: x' = -z, z' = x
+                bus_pos_final = []
+                for (x, y, z) in bus_pos:
+                    # Scale and center
+                    sx = (x - cx) * s
+                    sy = (y - bymin) * s
+                    sz = (z - cz) * s
+                    
+                    # Rotate 90 deg right (around Y axis)
+                    # x' = z
+                    # z' = -x
+                    rx = sz
+                    rz = -sx
+                    ry = sy
+                    bus_pos_final.append((rx, ry, rz))
+
+                bus_x, bus_y, bus_z = -15.0, 0.0, -8.0
+
+                if bus_uv and bus_tex and os.path.isfile(bus_tex):
+                    bus_tex_obj = create_texture_2d(bus_tex)
+                    bus_mesh = Mesh(bus_pos_final, bus_col, bus_uv, (bus_tex_obj.id if bus_tex_obj else None), gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z), _tex_obj=(bus_tex_obj if bus_tex_obj else None))
+                else:
+                    if bus_col:
+                        bus_mesh = Mesh(bus_pos_final, bus_col, bus_uv, None, gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z))
+                    else:
+                        fallback_cols = [(0.9, 0.8, 0.1)] * len(bus_pos_final) # Yellow fallback
+                        bus_mesh = Mesh(bus_pos_final, fallback_cols, bus_uv, None, gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z))
+
+                self.characters.append(MovingCharacter(bus_mesh, bus_x, bus_y, bus_z))
+                bustris = len(bus_pos_final)//3
+                print(f"Loaded bus model from '{bus_obj_path}': {bustris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({bus_x}, {bus_y}, {bus_z})")
+        except Exception as e:
+            print(f"WARNING: failed to create bus actor: {e}")
+
+        # Barrel
+        try:
+            barrel_obj_path = "assets/barrel/barrel.obj"
+            bpos, buv, btex, bcol = None, None, None, None
+            try:
+                bpos, buv, btex, bcol = load_obj_with_uv_mtl(barrel_obj_path, scale=1.0, center_y=0.0)
+            except Exception:
+                bpos = None
+
+            if bpos:
+                bys = [p[1] for p in bpos]
+                bymin, bymax = min(bys), max(bys)
+                model_h = max(1e-6, bymax - bymin)
+                desired_h = 0.90
+                s = desired_h / model_h
+                bpos_scaled = [(x*s, (y - bymin)*s, z*s) for (x, y, z) in bpos]
+
+                if buv and btex and os.path.isfile(btex):
+                    btex_obj = create_texture_2d(btex)
+                    barrel_mesh = Mesh(bpos_scaled, bcol, buv, (btex_obj.id if btex_obj else None), gl.GL_TRIANGLES, mat4_translate(3.0, 0.0, -8.0), _tex_obj=(btex_obj if btex_obj else None))
+                else:
+                    cols = bcol if bcol else [(0.55, 0.30, 0.10)] * len(bpos_scaled)
+                    barrel_mesh = Mesh(bpos_scaled, cols, buv, None, gl.GL_TRIANGLES, mat4_translate(3.0, 0.0, -8.0))
+
+                self.characters.append(MovingCharacter(barrel_mesh, 5.0, 0.0, -8.0))
+                try:
+                    btris = len(bpos_scaled)//3
+                except Exception:
+                    btris = 0
+                print(f"Loaded barrel model from '{barrel_obj_path}': {btris} tris (scale {s:.3f} -> height {desired_h} m) at (3.0, -8.0)")
+        except Exception as e:
+            print(f"WARNING: failed to create barrel actor: {e}")
+
+        # Truck
+        try:
+            truck_obj_path = "assets/truck/truck.obj"
+            tpos, tuv, ttex, tcol = None, None, None, None
+            try:
+                tpos, tuv, ttex, tcol = load_obj_with_uv_mtl(truck_obj_path, scale=1.0, center_y=0.0)
+            except Exception as load_err:
+                print(f"DEBUG: Failed to load truck OBJ: {load_err}")
+                tpos = None
+
+            if tpos:
+                txs = [p[0] for p in tpos]
+                tys = [p[1] for p in tpos]
+                tzs = [p[2] for p in tpos]
+                txmin, txmax = min(txs), max(txs)
+                tymin, tymax = min(tys), max(tys)
+                tzmin, tzmax = min(tzs), max(tzs)
+                
+                model_h = max(1e-6, tymax - tymin)
+                desired_h = 2.1
+                s = desired_h / model_h
+                
+                # Center X and Z, set Y bottom to 0
+                cx = (txmin + txmax) * 0.5
+                cz = (tzmin + tzmax) * 0.5
+                
+                tpos_scaled = [((x - cx)*s, (y - tymin)*s, (z - cz)*s) for (x, y, z) in tpos]
+
+                if tuv and ttex and os.path.isfile(ttex):
+                    ttex_obj = create_texture_2d(ttex)
+                    truck_mesh = Mesh(tpos_scaled, tcol, tuv, (ttex_obj.id if ttex_obj else None), gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0), _tex_obj=(ttex_obj if ttex_obj else None))
+                else:
+                    # If no texture but we have material colors, use them
+                    if tcol:
+                        truck_mesh = Mesh(tpos_scaled, tcol, tuv, None, gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0))
+                    else:
+                        # Fallback color (orange-ish)
+                        fallback_cols = [(0.80, 0.40, 0.10)] * len(tpos_scaled)
+                        truck_mesh = Mesh(tpos_scaled, fallback_cols, tuv, None, gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0))
+
+                self.characters.append(MovingCharacter(truck_mesh, -10.0, 0.0, -8.0))
+                ttris = len(tpos_scaled)//3
+                print(f"Loaded truck model from '{truck_obj_path}': {ttris} tris (scale {s:.6f} -> height {desired_h} m) centered at (-3.0, -8.0)")
+            else:
+                print(f"DEBUG: Truck OBJ loaded but returned empty (tpos=None)")
+        except Exception as e:
+            print(f"WARNING: failed to create truck actor: {e}")
+
+        # Car
+        try:
+            car_obj_path = "assets/car/car.obj"
+            cpos, cuv, ctex, ccol = None, None, None, None
+            try:
+                cpos, cuv, ctex, ccol = load_obj_with_uv_mtl(car_obj_path, scale=1.0, center_y=0.0)
+            except Exception as load_err:
+                print(f"DEBUG: Failed to load car OBJ: {load_err}")
+                cpos = None
+
+            if cpos:
+                cxs = [p[0] for p in cpos]
+                cys = [p[1] for p in cpos]
+                czs = [p[2] for p in cpos]
+                cxmin, cxmax = min(cxs), max(cxs)
+                cymin, cymax = min(cys), max(cys)
+                czmin, czmax = min(czs), max(czs)
+                
+                model_h = max(1e-6, cymax - cymin)
+                desired_h = 1.5
+                s = desired_h / model_h
+                
+                # Center X and Z, set Y bottom to 0
+                cx = (cxmin + cxmax) * 0.5
+                cz = (czmin + czmax) * 0.5
+                
+                cpos_scaled = [((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cpos]
+
+                # Position it next to the truck
+                car_x, car_y, car_z = -7, 0.0, -8.0
+
+                if cuv and ctex and os.path.isfile(ctex):
+                    ctex_obj = create_texture_2d(ctex)
+                    car_mesh = Mesh(cpos_scaled, ccol, cuv, (ctex_obj.id if ctex_obj else None), gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z), _tex_obj=(ctex_obj if ctex_obj else None))
+                else:
+                    if ccol:
+                        car_mesh = Mesh(cpos_scaled, ccol, cuv, None, gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z))
+                    else:
+                        fallback_cols = [(0.2, 0.5, 0.8)] * len(cpos_scaled) # Blue-ish
+                        car_mesh = Mesh(cpos_scaled, fallback_cols, cuv, None, gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z))
+
+                self.characters.append(MovingCharacter(car_mesh, car_x, car_y, car_z))
+                ctris = len(cpos_scaled)//3
+                print(f"Loaded car model from '{car_obj_path}': {ctris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({car_x}, {car_y}, {car_z})")
+        except Exception as e:
+            print(f"WARNING: failed to create static car actor: {e}")
+
+        # Traffic Cone
+        try:
+            cone_obj_path = "assets/traffic-cone/cone.obj"
+            cn_pos, cn_uv, cn_tex, cn_col = None, None, None, None
+            try:
+                cn_pos, cn_uv, cn_tex, cn_col = load_obj_with_uv_mtl(cone_obj_path, scale=1.0, center_y=0.0)
+            except Exception as load_err:
+                print(f"DEBUG: Failed to load cone OBJ: {load_err}")
+                cn_pos = None
+
+            if cn_pos:
+                cxs = [p[0] for p in cn_pos]
+                cys = [p[1] for p in cn_pos]
+                czs = [p[2] for p in cn_pos]
+                cxmin, cxmax = min(cxs), max(cxs)
+                cymin, cymax = min(cys), max(cys)
+                czmin, czmax = min(czs), max(czs)
+                
+                model_h = max(1e-6, cymax - cymin)
+                desired_h = 0.8  # 80cm
+                s = desired_h / model_h
+                
+                # Center X and Z, set Y bottom to 0
+                cx = (cxmin + cxmax) * 0.5
+                cz = (czmin + czmax) * 0.5
+                
+                cn_pos_scaled = [((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cn_pos]
+
+                # Position
+                cone_x, cone_y, cone_z = 10.0, 0.0, -10.0
+
+                if cn_uv and cn_tex and os.path.isfile(cn_tex):
+                    cn_tex_obj = create_texture_2d(cn_tex)
+                    cone_mesh = Mesh(cn_pos_scaled, cn_col, cn_uv, (cn_tex_obj.id if cn_tex_obj else None), gl.GL_TRIANGLES, mat4_translate(cone_x, cone_y, cone_z), _tex_obj=(cn_tex_obj if cn_tex_obj else None))
+                else:
+                    if cn_col:
+                        cone_mesh = Mesh(cn_pos_scaled, cn_col, cn_uv, None, gl.GL_TRIANGLES, mat4_translate(cone_x, cone_y, cone_z))
+                    else:
+                        fallback_cols = [(1.0, 0.5, 0.0)] * len(cn_pos_scaled) # Orange fallback
+                        cone_mesh = Mesh(cn_pos_scaled, fallback_cols, cn_uv, None, gl.GL_TRIANGLES, mat4_translate(cone_x, cone_y, cone_z))
+
+                self.characters.append(MovingCharacter(cone_mesh, cone_x, cone_y, cone_z))
+                cntris = len(cn_pos_scaled)//3
+                print(f"Loaded cone model from '{cone_obj_path}': {cntris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({cone_x}, {cone_y}, {cone_z})")
+        except Exception as e:
+            print(f"WARNING: failed to create traffic cone actor: {e}")
 
         # Lanes + grid
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
@@ -1075,9 +1343,6 @@ class AVHMI(pyglet.window.Window):
         # update characters
         for ch in self.characters:
             ch.update(dt)
-        # update surrounding vehicles
-        for vehicle in self.surrounding_vehicles:
-            vehicle.update(dt)
         # update street signs
         for ss in self.street_signs:
             ss.update(dt)
@@ -1149,12 +1414,6 @@ class AVHMI(pyglet.window.Window):
         # Draw characters
         for ch in self.characters:
             self.renderer.draw_mesh(ch.mesh, pv)
-
-        # Draw surrounding vehicles
-        for vehicle in self.surrounding_vehicles:
-            self.renderer.draw_mesh(vehicle.mesh, pv)
-            for w in vehicle.wheels:
-                self.renderer.draw_mesh(w['mesh'], pv)
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
