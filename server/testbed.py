@@ -390,9 +390,6 @@ class Mesh:
     model: List[float]
     _tex_obj: Optional[pyglet.image.Texture] = None 
 
-
-
-
 class Ego:
     def __init__(self):
         self.pos  = [0.0, 0.0, 0.0]
