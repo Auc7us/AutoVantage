@@ -2,7 +2,17 @@
 
 ## Latest - How to Run Testbed.py for Autonomous Simulation
 
-Run these commands:
+1. Clone the repository:
+```bash
+git clone https://github.com/WisconsinAutonomous/WAutoVantage.git
+```
+
+2. Navigate to this url to download the assets folder and add it into the root directory of the repository:
+```bash
+https://drive.google.com/drive/folders/1ibKiguTy_1TeR8rgnAemuxOex1Xt1wUe?usp=drive_link
+```
+
+3. Run these commands:
 ```bash
 python -m venv .wav
 .wav/Scripts/activate
