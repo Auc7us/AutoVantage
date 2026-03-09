@@ -1,3 +1,6 @@
 __pycache__/
 .wav
 /data
+/server/stream/
+log.txt
+/server/testbed-old.py

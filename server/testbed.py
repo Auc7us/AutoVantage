@@ -8,16 +8,10 @@ from pyglet.window import key, mouse
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
-# GStreamer RTSP support for NVIDIA Jetson/GPUs
-_GST_AVAILABLE = False
-try:
-    import gi
-    gi.require_version('Gst', '1.0')
-    gi.require_version('GstRtspServer', '1.0')
-    from gi.repository import Gst, GstRtspServer, GLib
-    Gst.init(None)
-except Exception:
-    _GST_AVAILABLE = False
+import sys, subprocess, threading
+
+import http.server
+import socketserver
 
 # ------------------------------------------------------------
 # Minimal MTL parser (grabs first map_Kd path)
@@ -302,6 +296,28 @@ def make_grid(size=80, step=2.0, color=(0.25, 0.25, 0.25)):
         cols  += [color,        color]
         v += step
     return verts, cols
+
+def make_box_triangles(lx, ly, lz, color=(0.1, 0.8, 0.3)):
+    """Create a box mesh with triangles for rendering."""
+    x0,x1 = -lx*0.5, lx*0.5
+    y0,y1 = 0.0, ly
+    z0,z1 = -lz*0.5, lz*0.5
+    faces = [
+        (x0,y1,z0),(x1,y1,z0),(x1,y1,z1),
+        (x0,y1,z0),(x1,y1,z1),(x0,y1,z1),
+        (x0,y0,z0),(x1,y0,z1),(x1,y0,z0),
+        (x0,y0,z0),(x0,y0,z1),(x1,y0,z1),
+        (x0,y0,z0),(x1,y1,z0),(x1,y0,z0),
+        (x0,y0,z0),(x0,y1,z0),(x1,y1,z0),
+        (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),
+        (x0,y0,z1),(x1,y1,z1),(x0,y1,z1),
+        (x0,y0,z0),(x0,y0,z1),(x0,y1,z1),
+        (x0,y0,z0),(x0,y1,z1),(x0,y1,z0),
+        (x1,y0,z0),(x1,y1,z1),(x1,y0,z1),
+        (x1,y0,z0),(x1,y1,z0),(x1,y1,z1),
+    ]
+    cols = [color]*len(faces)
+    return faces, cols
 
 # ------------------------------------------------------------
 # Street sign builders
@@ -740,100 +756,193 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
-class RTSPStreamer:
-    def __init__(self, width: int, height: int, fps: int = 30, port: int = 8554, mount: str = "/sim"):
+class FFmpegStreamer:
+    def __init__(self, width: int, height: int, fps: int = 30, mode: str = "hls", output_dir="stream"):
         self.width = width
         self.height = height
         self.fps = fps
-        self.port = port
-        self.mount = mount
-        self._loop = None
-        self._server = None
-        self._factory = None
-        self._appsrc = None
-        self._pts_ns = 0
+        self.mode = mode
         self.is_active = False
+        self.proc = None
+        self._frame_interval = 1.0 / fps
+        self._last_push = 0.0
+        
+        if mode == "hls":
+            # Always resolve relative to this script's location so it works
+            # no matter what working directory testbed.py is launched from.
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            abs_output_dir = os.path.join(script_dir, output_dir)
+            os.makedirs(abs_output_dir, exist_ok=True)
+            m3u8_path = os.path.join(abs_output_dir, "stream.m3u8").replace("\\", "/")
+            cmd = [
+                "ffmpeg", "-y", "-re",
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "-",
+                "-vf", "vflip",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-g", str(fps), 
+                "-keyint_min", str(fps),
+                "-f", "hls",
+                "-hls_time", "1",
+                "-hls_list_size", "5",
+                "-hls_flags", "delete_segments+append_list",
+                m3u8_path
+            ]
+            print(f"""\n{'='*60}
+FFmpeg HLS streaming active!
+  Stream folder : {abs_output_dir}
+  Playlist file : {m3u8_path}
 
-    def _choose_encoder(self):
-        if not _GST_AVAILABLE:
-            return None
+To view the stream, open a NEW terminal and run:
+  python -m http.server 8080 --directory "{abs_output_dir}"
+
+Then open in VLC (Open Network Stream):
+  http://localhost:8080/stream.m3u8
+
+Or in browser with hls.js / Native HLS Playback extension:
+  http://localhost:8080/stream.m3u8
+{'='*60}\n""")
+
+        else:
+            # UDP/RTP mode
+            cmd = [
+                "ffmpeg", "-y", "-re",
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+                "-r", str(fps), "-i", "-",
+                "-vf", "vflip",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-f", "rtp", "rtp://127.0.0.1:1234"
+            ]
+            print(f"FFmpeg (RTP/UDP) streaming to rtp://127.0.0.1:1234")
+            
         try:
-            if Gst.ElementFactory.find("nvv4l2h264enc"):
-                return "nvv4l2h264enc insert-sps-pps=true maxperf-enable=true bitrate=4000000"
-            if Gst.ElementFactory.find("nvh264enc"):
-                return "nvh264enc bitrate=4000"
-        except Exception:
-            pass
-        return "x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000"
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.is_active = True
+        except Exception as e:
+            print(f"Failed to start FFmpeg: {e}")
 
     def start(self):
-        if not _GST_AVAILABLE:
-            print("RTSP disabled: GStreamer not available on this system")
-            return False
-        enc = self._choose_encoder()
-        if enc is None:
-            print("RTSP disabled: no H.264 encoder available")
-            return False
-        launch = (
-            f"appsrc name=mysrc is-live=true format=GST_FORMAT_TIME caps=video/x-raw,format=RGB,width={self.width},height={self.height},framerate={self.fps}/1 "
-            f"! videoconvert ! {enc} ! rtph264pay name=pay0 pt=96"
-        )
-        try:
-            self._server = GstRtspServer.RTSPServer()
-            self._server.props.service = str(self.port)
-            self._factory = GstRtspServer.RTSPMediaFactory()
-            self._factory.set_launch(launch)
-            self._factory.set_latency(100)
-            self._factory.set_shared(True)
-
-            def on_configure(factory, media):
-                try:
-                    pipeline = media.get_element()
-                    self._appsrc = pipeline.get_by_name("mysrc")
-                    if self._appsrc:
-                        self._appsrc.set_property("stream-type", 0)
-                        self._appsrc.set_property("format", Gst.Format.TIME)
-                        self._appsrc.set_property("is-live", True)
-                        self._appsrc.set_property("do-timestamp", True)
-                except Exception as e:
-                    print(f"RTSP media-configure error: {e}")
-
-            self._factory.connect("media-configure", on_configure)
-            mounts = self._server.get_mount_points()
-            mounts.add_factory(self.mount, self._factory)
-            self._server.attach(None)
-            self._loop = GLib.MainLoop()
-            import threading
-            threading.Thread(target=self._loop.run, daemon=True).start()
-            self.is_active = True
-            print(f"RTSP streaming at rtsp://localhost:{self.port}{self.mount}")
-            return True
-        except Exception as e:
-            print(f"Failed to start RTSP server: {e}")
-            return False
+        return self.is_active
 
     def stop(self):
         self.is_active = False
-        try:
-            if self._loop is not None:
-                self._loop.quit()
-        except Exception:
-            pass
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
 
     def push_rgb_frame(self, data: bytes):
-        if not (self.is_active and _GST_AVAILABLE and self._appsrc is not None):
+        if not self.is_active or not self.proc:
             return
+
+        now = time.perf_counter()
+        if (now - self._last_push) < (self._frame_interval - 0.005): 
+            return
+
+        self._last_push = now
         try:
-            buf = Gst.Buffer.new_allocate(None, len(data), None)
-            buf.fill(0, data)
-            dur = int(1e9 / max(1, self.fps))
-            buf.pts = self._pts_ns
-            buf.dts = self._pts_ns
-            buf.duration = dur
-            self._pts_ns += dur
-            self._appsrc.emit("push-buffer", buf)
-        except Exception as e:
-            print(f"RTSP push error: {e}")
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+        except Exception:
+            self.is_active = False
+
+def start_hls_server(port):
+    import http.server
+    import socketserver
+
+    class CustomHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/':
+                self.path = '/player.html'
+            return http.server.SimpleHTTPRequestHandler.do_GET(self)
+
+        def log_message(self, format, *args):
+            return # Quiet down the console logs
+
+    def run_server():
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+        with socketserver.TCPServer(("", port), CustomHandler) as httpd:
+            print(f"HLS Player available at http://localhost:{port}")
+            httpd.serve_forever()
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+
+    def __init__(self, stream_dir: str, port: int = 8080):
+        import http.server, functools
+        self.port = port
+        self.stream_dir = stream_dir
+
+        parent = self  # capture in closure
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=os.path.dirname(stream_dir), **kw)
+
+            def do_GET(self):
+                if self.path == '/' or self.path == '/index.html':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(parent.PLAYER_HTML.encode())
+                    return
+                # Rewrite /stream/* to the actual stream subfolder
+                super().do_GET()
+
+            def end_headers(self):
+                # Allow CORS for hls.js
+                self.send_header('Access-Control-Allow-Origin', '*')
+                super().end_headers()
+
+            def log_message(self, fmt, *a):
+                pass  # silence request logs
+
+        self.httpd = http.server.HTTPServer(('', port), Handler)
+        t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        t.start()
+        print(f"  HLS player: http://localhost:{port}/")
+        print(f"  Raw .m3u8 : http://localhost:{port}/stream/stream.m3u8")
+
+
+class HLSHTTPServer:
+    def __init__(self, stream_dir, port=8080):
+        # The stream_dir is project_root/stream. 
+        # We serve from project_root to access player.html and the stream folder.
+        self.root_dir = os.path.dirname(stream_dir)
+        self.port = port
+        
+        class CustomHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=os.path.dirname(stream_dir), **kwargs)
+            
+            def do_GET(self):
+                # Serve player.html when the root URL is accessed
+                if self.path == '/':
+                    self.path = '/player.html'
+                return super().do_GET()
+
+            def log_message(self, format, *args):
+                return # Quiet down the logs
+
+        def run_server():
+            socketserver.TCPServer.allow_reuse_address = True
+            with socketserver.TCPServer(("", self.port), CustomHandler) as httpd:
+                print(f"\n[HLS Server] Player: http://localhost:{self.port}/")
+                print(f"[HLS Server] Stream: http://localhost:{self.port}/stream/stream.m3u8")
+                httpd.serve_forever()
+
+        self.thread = threading.Thread(target=run_server, daemon=True)
+        self.thread.start()
+
 
 class AVHMI(pyglet.window.Window):
     def __init__(self, width=1280, height=720, fps=60):
@@ -938,7 +1047,7 @@ class AVHMI(pyglet.window.Window):
         # Rolling state
         self._wheel_roll = 0.0
 
-        # Orange barricade
+        # Barricade Model
         bl, bd = 1.8*0.85, 0.6*0.85
         tl, td = 1.4*0.85, 0.4*0.85
         h      = 1.0*0.85
@@ -949,7 +1058,7 @@ class AVHMI(pyglet.window.Window):
         ]
         self.show_obstacles = True
 
-        # Human Models
+        # Human Model
         self.characters: List[MovingCharacter] = []
         human_obj_path = "assets/human/human.obj"
         try:
@@ -1103,113 +1212,7 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"WARNING: failed to create deer actor: {e}")
 
-        # Bike
-        try:
-            bike_obj_path = "assets/bike/bike.obj"
-            bkpos, bkuv, bktex, bkcol = None, None, None, None
-            try:
-                bkpos, bkuv, bktex, bkcol = load_obj_with_uv_mtl(bike_obj_path, scale=1.0, center_y=0.0)
-            except Exception as load_err:
-                print(f"DEBUG: Failed to load bike OBJ: {load_err}")
-                bkpos = None
-
-            if bkpos:
-                bkxs = [p[0] for p in bkpos]
-                bkys = [p[1] for p in bkpos]
-                bkzs = [p[2] for p in bkpos]
-                bkxmin, bkxmax = min(bkxs), max(bkxs)
-                bkymin, bkymax = min(bkys), max(bkys)
-                bkzmin, bkzmax = min(bkzs), max(bkzs)
-                
-                model_h = max(1e-6, bkymax - bkymin)
-                desired_h = 1.0  # 1 meter
-                s = desired_h / model_h
-                
-                cx = (bkxmin + bkxmax) * 0.5
-                cz = (bkzmin + bkzmax) * 0.5
-                
-                bkpos_scaled = [((x - cx)*s, (y - bkymin)*s, (z - cz)*s) for (x, y, z) in bkpos]
-
-                bike_x, bike_y, bike_z = 12.0, 0.0, -8.0
-
-                if bkuv and bktex and os.path.isfile(bktex):
-                    bktex_obj = create_texture_2d(bktex)
-                    bike_mesh = Mesh(bkpos_scaled, bkcol, bkuv, (bktex_obj.id if bktex_obj else None), gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z), _tex_obj=(bktex_obj if bktex_obj else None))
-                else:
-                    if bkcol:
-                        bike_mesh = Mesh(bkpos_scaled, bkcol, bkuv, None, gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z))
-                    else:
-                        fallback_cols = [(0.3, 0.3, 0.3)] * len(bkpos_scaled) # Grey fallback
-                        bike_mesh = Mesh(bkpos_scaled, fallback_cols, bkuv, None, gl.GL_TRIANGLES, mat4_translate(bike_x, bike_y, bike_z))
-
-                self.characters.append(MovingCharacter(bike_mesh, bike_x, bike_y, bike_z))
-                bktris = len(bkpos_scaled)//3
-                print(f"Loaded bike model from '{bike_obj_path}': {bktris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({bike_x}, {bike_y}, {bike_z})")
-        except Exception as e:
-            print(f"WARNING: failed to create bike actor: {e}")
-
-        # Bus
-        try:
-            bus_obj_path = "assets/bus/bus.obj"
-            bus_pos, bus_uv, bus_tex, bus_col = None, None, None, None
-            try:
-                bus_pos, bus_uv, bus_tex, bus_col = load_obj_with_uv_mtl(bus_obj_path, scale=1.0, center_y=0.0)
-            except Exception as load_err:
-                print(f"DEBUG: Failed to load bus OBJ: {load_err}")
-                bus_pos = None
-
-            if bus_pos:
-                bxs = [p[0] for p in bus_pos]
-                bys = [p[1] for p in bus_pos]
-                bzs = [p[2] for p in bus_pos]
-                bxmin, bxmax = min(bxs), max(bxs)
-                bymin, bymax = min(bys), max(bys)
-                bzmin, bzmax = min(bzs), max(bzs)
-                
-                model_h = max(1e-6, bymax - bymin)
-                desired_h = 3.0 # Bus height
-                s = desired_h / model_h
-                
-                # Center
-                cx = (bxmin + bxmax) * 0.5
-                cz = (bzmin + bzmax) * 0.5
-                
-                # Scale, Center, and Rotate 90 degrees left (around Y)
-                # Rotation: x' = -z, z' = x
-                bus_pos_final = []
-                for (x, y, z) in bus_pos:
-                    # Scale and center
-                    sx = (x - cx) * s
-                    sy = (y - bymin) * s
-                    sz = (z - cz) * s
-                    
-                    # Rotate 90 deg right (around Y axis)
-                    # x' = z
-                    # z' = -x
-                    rx = sz
-                    rz = -sx
-                    ry = sy
-                    bus_pos_final.append((rx, ry, rz))
-
-                bus_x, bus_y, bus_z = -15.0, 0.0, -8.0
-
-                if bus_uv and bus_tex and os.path.isfile(bus_tex):
-                    bus_tex_obj = create_texture_2d(bus_tex)
-                    bus_mesh = Mesh(bus_pos_final, bus_col, bus_uv, (bus_tex_obj.id if bus_tex_obj else None), gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z), _tex_obj=(bus_tex_obj if bus_tex_obj else None))
-                else:
-                    if bus_col:
-                        bus_mesh = Mesh(bus_pos_final, bus_col, bus_uv, None, gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z))
-                    else:
-                        fallback_cols = [(0.9, 0.8, 0.1)] * len(bus_pos_final) # Yellow fallback
-                        bus_mesh = Mesh(bus_pos_final, fallback_cols, bus_uv, None, gl.GL_TRIANGLES, mat4_translate(bus_x, bus_y, bus_z))
-
-                self.characters.append(MovingCharacter(bus_mesh, bus_x, bus_y, bus_z))
-                bustris = len(bus_pos_final)//3
-                print(f"Loaded bus model from '{bus_obj_path}': {bustris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({bus_x}, {bus_y}, {bus_z})")
-        except Exception as e:
-            print(f"WARNING: failed to create bus actor: {e}")
-
-        # Surrounding vehicles
+        # Surrounding Car Model
         self.vehicles = []
         try:
             car_obj_path = "assets/car/car.obj"
@@ -1242,54 +1245,6 @@ class AVHMI(pyglet.window.Window):
                 print(f"Loaded surrounding car model from '{car_obj_path}': {ctris} tris (scale {s:.3f} -> height {desired_h} m) at (-2.0, -8.0)")
         except Exception as e:
             print(f"WARNING: failed to create surrounding car actor: {e}")
-
-        # Truck
-        try:
-            truck_obj_path = "assets/truck/truck.obj"
-            tpos, tuv, ttex, tcol = None, None, None, None
-            try:
-                tpos, tuv, ttex, tcol = load_obj_with_uv_mtl(truck_obj_path, scale=1.0, center_y=0.0)
-            except Exception as load_err:
-                print(f"DEBUG: Failed to load truck OBJ: {load_err}")
-                tpos = None
-
-            if tpos:
-                txs = [p[0] for p in tpos]
-                tys = [p[1] for p in tpos]
-                tzs = [p[2] for p in tpos]
-                txmin, txmax = min(txs), max(txs)
-                tymin, tymax = min(tys), max(tys)
-                tzmin, tzmax = min(tzs), max(tzs)
-                
-                model_h = max(1e-6, tymax - tymin)
-                desired_h = 2.1
-                s = desired_h / model_h
-                
-                # Center X and Z, set Y bottom to 0
-                cx = (txmin + txmax) * 0.5
-                cz = (tzmin + tzmax) * 0.5
-                
-                tpos_scaled = [((x - cx)*s, (y - tymin)*s, (z - cz)*s) for (x, y, z) in tpos]
-
-                if tuv and ttex and os.path.isfile(ttex):
-                    ttex_obj = create_texture_2d(ttex)
-                    truck_mesh = Mesh(tpos_scaled, tcol, tuv, (ttex_obj.id if ttex_obj else None), gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0), _tex_obj=(ttex_obj if ttex_obj else None))
-                else:
-                    # If no texture but we have material colors, use them
-                    if tcol:
-                        truck_mesh = Mesh(tpos_scaled, tcol, tuv, None, gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0))
-                    else:
-                        # Fallback color (orange-ish)
-                        fallback_cols = [(0.80, 0.40, 0.10)] * len(tpos_scaled)
-                        truck_mesh = Mesh(tpos_scaled, fallback_cols, tuv, None, gl.GL_TRIANGLES, mat4_translate(-3.0, 0.0, -8.0))
-
-                self.characters.append(MovingCharacter(truck_mesh, -10.0, 0.0, -8.0))
-                ttris = len(tpos_scaled)//3
-                print(f"Loaded truck model from '{truck_obj_path}': {ttris} tris (scale {s:.6f} -> height {desired_h} m) centered at (-3.0, -8.0)")
-            else:
-                print(f"DEBUG: Truck OBJ loaded but returned empty (tpos=None)")
-        except Exception as e:
-            print(f"WARNING: failed to create truck actor: {e}")
 
         # Car
         try:
@@ -1388,13 +1343,6 @@ class AVHMI(pyglet.window.Window):
         self.renderer = Renderer()
         self.last_time = time.perf_counter()
         pyglet.clock.schedule_interval(self.update, 1.0/self.fps)
-
-        # Start RTSP streaming if available
-        try:
-            self.streamer = RTSPStreamer(self.width, self.height, self.fps, port=8554, mount="/sim")
-            self.streamer.start()
-        except Exception as e:
-            print(f"RTSP init failed: {e}")
 
 
 
@@ -1568,16 +1516,40 @@ class AVHMI(pyglet.window.Window):
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
 
-        # Capture and stream current frame via RTSP
-        try:
-            if getattr(self, 'streamer', None) and self.streamer.is_active:
-                img = pyglet.image.get_buffer_manager().get_color_buffer().get_image_data()
-                data = img.get_data('RGB', self.width * 3)
-                self.streamer.push_rgb_frame(data)
-        except Exception as e:
-            pass
+        if getattr(self, 'streamer', None) and self.streamer.is_active:
+            now = time.perf_counter()
+            if (now - self.streamer._last_push) >= (self.streamer._frame_interval - 0.005):
+                try:
+                    # Capture frame
+                    buf = (gl.GLubyte * (self.width * self.height * 3))()
+                    gl.glReadPixels(0, 0, self.width, self.height,
+                                    gl.GL_RGB, gl.GL_UNSIGNED_BYTE, buf)
+                    
+                    self.streamer.push_rgb_frame(bytes(buf))
+                    
+                    # Lock the next frame timing
+                    self.streamer._last_push = now 
+                except Exception as e:
+                    pass
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="AV HMI with FFmpeg Streaming")
+    parser.add_argument("--stream", type=str, choices=["hls", "udp", "none"], default="none", help="Enable streaming to HLS or UDP/RTP")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port for HLS player (default: 8080)")
+    args = parser.parse_args()
+
     window = AVHMI(1280, 720, 60)
+    
+    if args.stream != "none":
+        window.streamer = FFmpegStreamer(1280, 720, fps=30, mode=args.stream)
+        if args.stream == "hls":
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            stream_dir = os.path.join(script_dir, "stream")
+            HLSHTTPServer(stream_dir, port=args.port)
+    
     pyglet.app.run()
+    
+    if getattr(window, 'streamer', None):
+        window.streamer.stop()
