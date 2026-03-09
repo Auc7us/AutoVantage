@@ -2,33 +2,23 @@
 
 ## Latest - How to Run Testbed.py for Autonomous Simulation
 
-1. Clone the repository:
+1. Run these commands:
 ```bash
 git clone https://github.com/WisconsinAutonomous/WAutoVantage.git
-```
-
-2. Navigate to this url to download the assets folder and add it into the root directory of the repository:
-```bash
-https://drive.google.com/drive/folders/1ibKiguTy_1TeR8rgnAemuxOex1Xt1wUe?usp=drive_link
-```
-
-3. Run these commands:
-```bash
 python -m venv .wav
 .wav/Scripts/activate
 pip install pyglet
 python server/testbed.py
 ```
 
-## How to Run Videosimulation.py for Video Simulation
+## How to Stream on Localhost
 
 Run these commands:
 ```bash
-python -m venv .wav
-.wav/Scripts/activate
-pip install opencv-python
-python server/videosimulation.py
+python server/testbed.py --stream hls
 ```
+
+To view the stream, open Localhost at the following url: http://localhost:8080/
 
 ## Overview
 
