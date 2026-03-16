@@ -9,8 +9,7 @@ Environment is a clean slate based on testbed-obj-det.py.
 import math, time, ctypes, os, sys, argparse, json
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
-from object_detection import ObjectDetectionSystem
-
+ 
 try:
     import pyglet
     from pyglet.window import key, mouse
@@ -174,6 +173,34 @@ def load_obj_with_uv_mtl(obj_path: str, scale=1.0, center_y=0.0):
 # ------------------------------------------------------------
 # Detection Support
 # ------------------------------------------------------------
+class ObjectDetectionSystem:
+    """Mock object detection system for simulation"""
+    def __init__(self, video_path, log_file="log.txt", use_yolo=False):
+        self.video_path = video_path
+        self.log_file = log_file
+        self.use_yolo = use_yolo
+        self.frame_count = 0
+        
+    def process_frame(self, frame):
+        """Process a frame and log mock detection data"""
+        # For now, just log some mock data periodically
+        self.frame_count += 1
+        
+        # Mock some detections every few frames
+        if self.frame_count % 30 == 0:
+            mock_data = {
+                "frame": self.frame_count,
+                "obj_class": 1,  # Car
+                "obj_cartesian_coords": [5.0, 10.0, 0.0]  # x, y, z relative to car
+            }
+            
+            # Write to log file
+            try:
+                with open(self.log_file, 'a') as f:
+                    f.write(f"OBJ_DATA:{json.dumps(mock_data)}\n")
+            except:
+                pass
+
 class LogParser:
     def __init__(self, filename="log.txt"):
         self.filename = filename
@@ -215,7 +242,20 @@ class DetectedObject:
             self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_identity())
 
     def update_from_data(self, data):
-        coords = data.get("obj_cartesian_coords", [0,0,0])
+        # Handle both dictionary and integer data formats
+        if isinstance(data, dict):
+            coords = data.get("obj_cartesian_coords", [0,0,0])
+            obj_class = data.get("obj_class", self.obj_class)
+        else:
+            # If data is an integer (obj_class), keep current coords
+            coords = self.pos
+            obj_class = data
+        
+        # Update object class if it changed
+        if obj_class != self.obj_class:
+            self.obj_class = obj_class
+            self._init_mesh()  # Reinitialize mesh with new class
+        
         if coords[0] > 9000: return
         # Mapping from detector (relative to car) to world
         # Detector uses X=lateral, Y=depth
@@ -503,7 +543,20 @@ class WASimulation(pyglet.window.Window):
                     if oid in self.detected_entities:
                         self.detected_entities[oid].update_from_data(data)
                     else:
-                        self.detected_entities[oid] = DetectedObject(oid, data, self.assets)
+                        # Create a proper data dictionary for the DetectedObject constructor
+                        # Handle both dictionary and integer data formats
+                        if isinstance(data, dict):
+                            obj_data = {
+                                "obj_class": data.get("obj_class", 1),
+                                "obj_cartesian_coords": data.get("obj_cartesian_coords", [0, 0, 0])
+                            }
+                        else:
+                            # If data is an integer (obj_class), create minimal dict
+                            obj_data = {
+                                "obj_class": data,
+                                "obj_cartesian_coords": [0, 0, 0]
+                            }
+                        self.detected_entities[oid] = DetectedObject(oid, obj_data, self.assets)
             
             # Dynamically adjust left_w to match video aspect ratio
             h, w = frame.shape[:2]

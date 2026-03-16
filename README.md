@@ -11,14 +11,27 @@ pip install pyglet
 python server/testbed.py
 ```
 
-## How to Stream on Localhost
+### Jetson Streaming Integration
 
-Run these commands:
+**Prerequisites:**
+- NVIDIA Jetson
+- FFmpeg installed with NVENC support (`hevc_nvenc`)
+
+**How to Use:**
+1. The streaming module initializes automatically if FFmpeg and NVENC are available when running the simulation.
+2. The simulation streams H.265 video via RTP to `127.0.0.1:5004` (by default) with zero-latency profiling.
+3. A `stream.sdp` file is generated in the root directory. To view the low-latency stream, open the SDP file using a media player like VLC or ffplay.
+
+Using VLC:
 ```bash
-python server/testbed.py --stream hls
+vlc stream.sdp
 ```
 
-To view the stream, open Localhost at the following url: http://localhost:8080/
+Using ffplay:
+```bash
+ffplay -protocol_whitelist file,rtp,udp -i stream.sdp
+```
+
 
 ## Overview
 

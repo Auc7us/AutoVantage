@@ -1,5 +1,5 @@
 # Pyglet 2.1.9 • Modern OpenGL (core profile) • Textured OBJ support
-import math, time, random, ctypes, os
+import math, time, ctypes, os
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -8,10 +8,6 @@ from pyglet.window import key, mouse
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
-import sys, subprocess, threading
-
-import http.server
-import socketserver
 
 # ------------------------------------------------------------
 # Minimal MTL parser (grabs first map_Kd path)
@@ -756,192 +752,7 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
-class FFmpegStreamer:
-    def __init__(self, width: int, height: int, fps: int = 30, mode: str = "hls", output_dir="stream"):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.mode = mode
-        self.is_active = False
-        self.proc = None
-        self._frame_interval = 1.0 / fps
-        self._last_push = 0.0
-        
-        if mode == "hls":
-            # Always resolve relative to this script's location so it works
-            # no matter what working directory testbed.py is launched from.
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            abs_output_dir = os.path.join(script_dir, output_dir)
-            os.makedirs(abs_output_dir, exist_ok=True)
-            m3u8_path = os.path.join(abs_output_dir, "stream.m3u8").replace("\\", "/")
-            cmd = [
-                "ffmpeg", "-y", "-re",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-pix_fmt", "rgb24",
-                "-s", f"{width}x{height}",
-                "-r", str(fps),
-                "-i", "-",
-                "-vf", "vflip",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-g", str(fps), 
-                "-keyint_min", str(fps),
-                "-f", "hls",
-                "-hls_time", "1",
-                "-hls_list_size", "5",
-                "-hls_flags", "delete_segments+append_list",
-                m3u8_path
-            ]
-            print(f"""\n{'='*60}
-FFmpeg HLS streaming active!
-  Stream folder : {abs_output_dir}
-  Playlist file : {m3u8_path}
 
-To view the stream, open a NEW terminal and run:
-  python -m http.server 8080 --directory "{abs_output_dir}"
-
-Then open in VLC (Open Network Stream):
-  http://localhost:8080/stream.m3u8
-
-Or in browser with hls.js / Native HLS Playback extension:
-  http://localhost:8080/stream.m3u8
-{'='*60}\n""")
-
-        else:
-            # UDP/RTP mode
-            cmd = [
-                "ffmpeg", "-y", "-re",
-                "-f", "rawvideo", "-vcodec", "rawvideo",
-                "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-                "-r", str(fps), "-i", "-",
-                "-vf", "vflip",
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-f", "rtp", "rtp://127.0.0.1:1234"
-            ]
-            print(f"FFmpeg (RTP/UDP) streaming to rtp://127.0.0.1:1234")
-            
-        try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self.is_active = True
-        except Exception as e:
-            print(f"Failed to start FFmpeg: {e}")
-
-    def start(self):
-        return self.is_active
-
-    def stop(self):
-        self.is_active = False
-        if self.proc:
-            try:
-                self.proc.stdin.close()
-                self.proc.wait(timeout=2)
-            except Exception:
-                pass
-
-    def push_rgb_frame(self, data: bytes):
-        if not self.is_active or not self.proc:
-            return
-
-        now = time.perf_counter()
-        if (now - self._last_push) < (self._frame_interval - 0.005): 
-            return
-
-        self._last_push = now
-        try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
-        except Exception:
-            self.is_active = False
-
-def start_hls_server(port):
-    import http.server
-    import socketserver
-
-    class CustomHandler(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == '/':
-                self.path = '/player.html'
-            return http.server.SimpleHTTPRequestHandler.do_GET(self)
-
-        def log_message(self, format, *args):
-            return # Quiet down the console logs
-
-    def run_server():
-        os.chdir(os.path.dirname(os.path.abspath(__file__)))
-        with socketserver.TCPServer(("", port), CustomHandler) as httpd:
-            print(f"HLS Player available at http://localhost:{port}")
-            httpd.serve_forever()
-
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-
-    def __init__(self, stream_dir: str, port: int = 8080):
-        import http.server, functools
-        self.port = port
-        self.stream_dir = stream_dir
-
-        parent = self  # capture in closure
-
-        class Handler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, directory=os.path.dirname(stream_dir), **kw)
-
-            def do_GET(self):
-                if self.path == '/' or self.path == '/index.html':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write(parent.PLAYER_HTML.encode())
-                    return
-                # Rewrite /stream/* to the actual stream subfolder
-                super().do_GET()
-
-            def end_headers(self):
-                # Allow CORS for hls.js
-                self.send_header('Access-Control-Allow-Origin', '*')
-                super().end_headers()
-
-            def log_message(self, fmt, *a):
-                pass  # silence request logs
-
-        self.httpd = http.server.HTTPServer(('', port), Handler)
-        t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        t.start()
-        print(f"  HLS player: http://localhost:{port}/")
-        print(f"  Raw .m3u8 : http://localhost:{port}/stream/stream.m3u8")
-
-
-class HLSHTTPServer:
-    def __init__(self, stream_dir, port=8080):
-        # The stream_dir is project_root/stream. 
-        # We serve from project_root to access player.html and the stream folder.
-        self.root_dir = os.path.dirname(stream_dir)
-        self.port = port
-        
-        class CustomHandler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, directory=os.path.dirname(stream_dir), **kwargs)
-            
-            def do_GET(self):
-                # Serve player.html when the root URL is accessed
-                if self.path == '/':
-                    self.path = '/player.html'
-                return super().do_GET()
-
-            def log_message(self, format, *args):
-                return # Quiet down the logs
-
-        def run_server():
-            socketserver.TCPServer.allow_reuse_address = True
-            with socketserver.TCPServer(("", self.port), CustomHandler) as httpd:
-                print(f"\n[HLS Server] Player: http://localhost:{self.port}/")
-                print(f"[HLS Server] Stream: http://localhost:{self.port}/stream/stream.m3u8")
-                httpd.serve_forever()
-
-        self.thread = threading.Thread(target=run_server, daemon=True)
-        self.thread.start()
 
 
 class AVHMI(pyglet.window.Window):
@@ -1140,7 +951,7 @@ class AVHMI(pyglet.window.Window):
                 ys = [p[1] for p in cpos]
                 ymin, ymax = min(ys), max(ys)
                 model_h = max(1e-6, ymax - ymin)
-                desired_h =0.75  # Assuming a desired height of 1.0 meter for the cone
+                desired_h =0.75
                 s = desired_h / model_h
                 cpos_scaled = [(x*s, (y - ymin)*s, z*s) for (x, y, z) in cpos]
             else:
@@ -1292,8 +1103,6 @@ class AVHMI(pyglet.window.Window):
                 print(f"Loaded car model from '{car_obj_path}': {ctris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({car_x}, {car_y}, {car_z})")
         except Exception as e:
             print(f"WARNING: failed to create static car actor: {e}")
-
-
 
         # Lanes + grid
         lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
@@ -1515,41 +1324,33 @@ class AVHMI(pyglet.window.Window):
 
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
-
-        if getattr(self, 'streamer', None) and self.streamer.is_active:
-            now = time.perf_counter()
-            if (now - self.streamer._last_push) >= (self.streamer._frame_interval - 0.005):
-                try:
-                    # Capture frame
-                    buf = (gl.GLubyte * (self.width * self.height * 3))()
-                    gl.glReadPixels(0, 0, self.width, self.height,
-                                    gl.GL_RGB, gl.GL_UNSIGNED_BYTE, buf)
-                    
-                    self.streamer.push_rgb_frame(bytes(buf))
-                    
-                    # Lock the next frame timing
-                    self.streamer._last_push = now 
-                except Exception as e:
-                    pass
+        
+        if hasattr(self, 'streaming'):
+            self.streaming.push_frame()
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="AV HMI with FFmpeg Streaming")
-    parser.add_argument("--stream", type=str, choices=["hls", "udp", "none"], default="none", help="Enable streaming to HLS or UDP/RTP")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP port for HLS player (default: 8080)")
-    args = parser.parse_args()
-
+    try:
+        from streaming_integration import StreamingIntegration
+        streaming = StreamingIntegration(
+            width=1280,
+            height=720,
+            fps=30,
+            rtp_host="127.0.0.1",
+            rtp_port=5004
+        )
+    except ImportError:
+        print("Streaming module not available - running without streaming")
+        streaming = None
+    
+    # Create and run the main window
     window = AVHMI(1280, 720, 60)
     
-    if args.stream != "none":
-        window.streamer = FFmpegStreamer(1280, 720, fps=30, mode=args.stream)
-        if args.stream == "hls":
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            stream_dir = os.path.join(script_dir, "stream")
-            HLSHTTPServer(stream_dir, port=args.port)
+    if streaming:
+        window.streaming = streaming
     
-    pyglet.app.run()
-    
-    if getattr(window, 'streamer', None):
-        window.streamer.stop()
+    try:
+        pyglet.app.run()
+    finally:
+        if streaming:
+            streaming.stop()
