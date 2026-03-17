@@ -40,10 +40,13 @@ class H265Streamer:
             self.logger.error("FFmpeg not available - streaming disabled")
             return
 
-        # Check if NVENC is available  
-        if not self._check_nvenc_availability():
-            self.logger.error("NVENC hardware encoder not available - streaming disabled")
-            return
+        # Select the best available encoder
+        if self._check_nvenc_availability():
+            self.encoder = 'hevc_nvenc'
+            self.logger.info("Using Hardware Encoder: hevc_nvenc")
+        else:
+            self.encoder = 'libx265'
+            self.logger.info("NVENC hardware encoder not found. falling back to Software Encoder: libx265")
             
         # Start streaming
         self._start_streaming()
@@ -71,14 +74,24 @@ class H265Streamer:
                 text=True
             )
             
-            if 'hevc_nvenc' in result.stdout:
-                self.logger.info("NVENC H.265 encoder available")
+            if 'hevc_nvenc' not in result.stdout:
+                self.logger.error("NVENC H.265 encoder not found in FFmpeg binary")
+                return False
+        
+            test_cmd = [
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'testsrc=s=64x64:r=1', 
+                '-t', '1', '-c:v', 'hevc_nvenc', '-f', 'null', '-'
+            ]
+            test_result = subprocess.run(test_cmd, capture_output=True)
+            
+            if test_result.returncode == 0:
+                self.logger.info("NVENC hardware initialization successful")
                 return True
             else:
-                self.logger.error("NVENC H.265 encoder not found in FFmpeg")
+                self.logger.warning("NVENC binary present but hardware initialization failed (check drivers/GPU)")
                 return False
                 
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
             self.logger.error("Failed to check NVENC availability: %s", e)
             return False
     
@@ -86,39 +99,51 @@ class H265Streamer:
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',  
-            '-re',  
             '-f', 'rawvideo',  
             '-vcodec', 'rawvideo',  
             '-s', f'{self.width}x{self.height}',
             '-pix_fmt', 'rgb24',
             '-r', str(self.fps),
             '-i', '-',
-            '-vf', 'vflip',
-            '-c:v', 'hevc_nvenc',
-            '-preset', 'p1',
-            '-tune', 'ull',
-            '-zerolatency', '1',
-            '-profile:v', 'main',
-            '-level', '5.1',
-            '-b:v', '5000k',
+            '-vf', 'vflip,format=yuv420p',
+        ]
+        
+        if self.encoder == 'hevc_nvenc':
+            ffmpeg_cmd.extend([
+                '-c:v', 'hevc_nvenc',
+                '-preset', 'p1',
+                '-tune', 'ull',
+                '-zerolatency', '1',
+                '-b:v', '5000k'
+            ])
+        else:
+            ffmpeg_cmd.extend([
+                '-c:v', 'libx265',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-x265-params', 'keyint=15:min-keyint=15:repeat-headers=1'
+            ])
+            
+        ffmpeg_cmd.extend([
             '-f', 'rtp',
             f'rtp://{self.rtp_host}:{self.rtp_port}'
-        ]
+        ])
         
         try:
             self.proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 bufsize=0
             )
             
-            self._create_sdp_file()    
+            self._create_sdp_file()
+            self.is_active = True
+            
             self.worker = threading.Thread(target=self._write_worker, daemon=True)
             self.worker.start()
             
-            self.is_active = True
             self.logger.info(f"Streaming started: RTP to {self.rtp_host}:{self.rtp_port}")
             self.logger.info(f"SDP file created: stream.sdp")
             
@@ -128,14 +153,15 @@ class H265Streamer:
     
     def _create_sdp_file(self):
         sdp_content = f"""v=0
-            o=- 0 0 IN IP4 {self.rtp_host}
-            s=H265_NVENC_Stream
-            c=IN IP4 {self.rtp_host}
-            t=0 0
-            m=video {self.rtp_port} RTP/AVP 96
-            a=rtpmap:96 H265/90000
-            a=fmtp:96 profile-level-id=64001f;packetization-mode=1
-        """
+o=- 0 0 IN IP4 {self.rtp_host}
+s=H265 Streaming
+c=IN IP4 {self.rtp_host}
+t=0 0
+m=video {self.rtp_port} RTP/AVP 96
+a=rtpmap:96 H265/90000
+a=fmtp:96 profile-level-id=64001f;packetization-mode=1
+a=framesize:96 {self.width}-{self.height}
+"""
         
         try:
             with open("stream.sdp", "w") as f:

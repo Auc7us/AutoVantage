@@ -57,7 +57,6 @@ class StreamingIntegration:
         current_time = time.perf_counter()
         if (current_time - self._last_push) >= (self._frame_interval - 0.002):
             try:
-                # Capture frame from OpenGL
                 frame_data = self._capture_opengl_frame()
                 if frame_data:
                     self.streamer.push_frame(frame_data)
