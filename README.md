@@ -19,13 +19,14 @@ python server/testbed.py
 
 **How to Use:**
 1. The streaming module initializes automatically if FFmpeg and NVENC are available when running the simulation.
-2. The simulation streams H.265 video via RTP to `127.0.0.1:5004` (by default) with zero-latency profiling.
-3. A `stream.sdp` file is generated in the root directory. To view the low-latency stream, open the SDP file using a media player like ffplay.
+2. The simulation streams H.265 video via RTP to `127.0.0.1:5004`. Change this to proper IP address when testing between devices.
 
-Using ffplay:
+Open a new bash terminal and type in this command:
 ```bash
 ffplay -protocol_whitelist file,rtp,udp -i stream.sdp
 ```
+
+You should be able to view a 2nd stream that follows the vehicle's movements in the testbed environment.
 
 ## Overview
 
