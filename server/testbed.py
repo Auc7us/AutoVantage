@@ -40,6 +40,8 @@ HEADING_MOTION_MIN_STEP_M = 0.10
 HEADING_HISTORY_SIZE = 6
 MOTION_HEADING_MESH_OFFSET_DEG = 180.0
 MOTION_HEADING_MESH_OFFSET_RAD = math.radians(MOTION_HEADING_MESH_OFFSET_DEG)
+ORIENTATION_RENDER_BLEND_ALPHA = 0.26
+LANE_SNAP_RENDER_BLEND_ALPHA = 0.42
 LANE_LATERAL_THRESHOLD_M = 2.2
 LANE_LONGITUDINAL_LOOKAHEAD_M = 60.0
 LANE_CONSENSUS_MIN_NEIGHBORS = 2
@@ -63,8 +65,6 @@ LANE_ORIENTATION_CLASSES = {1, 11, 13}
 LANE_ORIENTATION_SNAP_DISTANCE_M = 4.5
 LANE_ORIENTATION_MIN_SEGMENT_M = 0.35
 LANE_ORIENTATION_CELL_SIZE_M = 6.0
-LANE_ORIENTATION_SWITCH_MARGIN_DEG = 18.0
-LANE_ORIENTATION_PERPENDICULAR_MIN_SPEED_MPS = 1.5
 ORIENTATION_UPDATE_INTERVAL_FRAMES = 3
 GROUND_SPEED_FRESHNESS_SEC = 0.45
 
@@ -254,6 +254,14 @@ def lerp_angle(current, target, alpha):
     delta = math.atan2(math.sin(target - current), math.cos(target - current))
     return current + delta * alpha
 
+def wrap_angle(theta):
+    return math.atan2(math.sin(theta), math.cos(theta))
+
+def rotate_local_xz(x, z, yaw):
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return ((c * x) - (s * z), (s * x) + (c * z))
+
 def perspective(fovy_deg, aspect, znear, zfar):
     f = 1.0 / math.tan(math.radians(fovy_deg)/2.0)
     nf = 1.0 / (znear - zfar)
@@ -382,6 +390,23 @@ def smooth_polyline(points, passes=1):
         refined.append(smoothed[-1])
         smoothed = refined
     return smoothed
+
+
+def resample_polyline_for_orientation(points, min_segment_length):
+    if len(points) < 2:
+        return list(points)
+
+    sampled = [tuple(points[0])]
+    anchor = points[0]
+    for point in points[1:-1]:
+        if math.hypot(point[0] - anchor[0], point[2] - anchor[2]) >= min_segment_length:
+            sampled.append(tuple(point))
+            anchor = point
+
+    tail = tuple(points[-1])
+    if sampled[-1] != tail:
+        sampled.append(tail)
+    return sampled
 
 
 def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
@@ -1198,6 +1223,7 @@ class DetectedEntity:
         self._tracked_local_pose = None
         self._tracked_local_velocity = [0.0, 0.0, 0.0]
         self._motion_yaw = None
+        self._render_yaw = None
         self._ground_velocity_mps = [0.0, 0.0]
         self._ground_motion_history = []
         self._last_motion_pose = None
@@ -1213,14 +1239,15 @@ class DetectedEntity:
         self.custom_classification = int(detection.get("custom_classification", 0))
         self.last_seen = time.perf_counter()
 
-    def set_local_pose(self, x: float, y: float, z: float, camera_origin_local, ego_motion_local, detection_dt: Optional[float]):
+    def set_local_pose(self, x: float, y: float, z: float, camera_origin_local, ego_motion_local, ego_delta_yaw: float, detection_dt: Optional[float]):
         raw_pose = [x, y, z]
         filtered_pose = self._filter_local_pose(raw_pose, detection_dt)
         motion_pose = self._tracked_local_pose if self._tracked_local_pose is not None else filtered_pose
-        self._update_motion_heading(motion_pose, ego_motion_local, detection_dt)
+        self._update_motion_heading(motion_pose, ego_motion_local, ego_delta_yaw, detection_dt)
+        resolved_yaw = self._refresh_render_yaw()
 
         if self.obj_class in VEHICLE_CENTER_CORRECTION_CLASSES:
-            new_pose = self._vehicle_center_from_nearest_point(filtered_pose, camera_origin_local)
+            new_pose = self._vehicle_center_from_nearest_point(filtered_pose, camera_origin_local, motion_yaw=resolved_yaw)
         else:
             new_pose = filtered_pose
 
@@ -1262,10 +1289,11 @@ class DetectedEntity:
             tracked_z + (self._tracked_local_velocity[2] * POSE_PREDICTION_LOOKAHEAD_SEC),
         ]
 
-    def _update_motion_heading(self, pose, ego_motion_local, detection_dt: Optional[float]):
+    def _update_motion_heading(self, pose, ego_motion_local, ego_delta_yaw: float, detection_dt: Optional[float]):
         if self._last_motion_pose is not None:
-            dx = pose[0] - self._last_motion_pose[0]
-            dz = pose[2] - self._last_motion_pose[2]
+            prev_x, prev_z = rotate_local_xz(self._last_motion_pose[0], self._last_motion_pose[2], -ego_delta_yaw)
+            dx = pose[0] - prev_x
+            dz = pose[2] - prev_z
             ground_dx = dx + ego_motion_local[0]
             ground_dz = dz + ego_motion_local[2]
             if self.obj_class in MOTION_HEADING_CLASSES and math.hypot(ground_dx, ground_dz) >= HEADING_MOTION_MIN_STEP_M:
@@ -1297,6 +1325,24 @@ class DetectedEntity:
                 self._ground_velocity_mps[0] *= 0.82
                 self._ground_velocity_mps[1] *= 0.82
         self._last_motion_pose = list(pose)
+
+    def _target_render_yaw(self):
+        if self._lane_snap_yaw is not None:
+            return self._lane_snap_yaw
+        return self._motion_yaw
+
+    def _refresh_render_yaw(self):
+        target_yaw = self._target_render_yaw()
+        if target_yaw is None:
+            return self._render_yaw
+
+        if self._render_yaw is None:
+            self._render_yaw = target_yaw
+            return self._render_yaw
+
+        blend_alpha = LANE_SNAP_RENDER_BLEND_ALPHA if self._lane_snap_yaw is not None else ORIENTATION_RENDER_BLEND_ALPHA
+        self._render_yaw = lerp_angle(self._render_yaw, target_yaw, blend_alpha)
+        return self._render_yaw
 
     def _vehicle_center_from_nearest_point(self, raw_pose, camera_origin_local, motion_yaw: Optional[float] = None):
         motion_yaw = self._motion_yaw if motion_yaw is None else motion_yaw
@@ -1351,8 +1397,9 @@ class DetectedEntity:
             return
 
         if hasattr(actor, "mesh"):
-            if self.obj_class in MOTION_HEADING_CLASSES and self._motion_yaw is not None:
-                local_model = mat4_mul(local_model, mat4_rotate_y(self._motion_yaw))
+            resolved_yaw = self._refresh_render_yaw()
+            if self.obj_class in MOTION_HEADING_CLASSES and resolved_yaw is not None:
+                local_model = mat4_mul(local_model, mat4_rotate_y(resolved_yaw))
             world_model = mat4_mul(anchor_model, local_model)
             actor.mesh.model = world_model
         elif isinstance(actor, Mesh):
@@ -1379,13 +1426,14 @@ class DetectedEntity:
         speed = math.hypot(self._ground_velocity_mps[0], self._ground_velocity_mps[1])
         if speed >= HEADING_MIN_SPEED_MPS:
             return math.atan2(self._ground_velocity_mps[0], -self._ground_velocity_mps[1]) + MOTION_HEADING_MESH_OFFSET_RAD
+        if self._render_yaw is not None:
+            return self._render_yaw
         if self._lane_snap_yaw is not None:
             return self._lane_snap_yaw
         return self._motion_yaw
 
-    def snap_to_lane_yaw(self, snapped_yaw):
+    def snap_to_lane_yaw(self, snapped_yaw: Optional[float]):
         self._lane_snap_yaw = snapped_yaw
-        self._motion_yaw = snapped_yaw
 
     def draw(self, renderer: "Renderer", pv):
         actor = self.actor
@@ -1612,6 +1660,7 @@ class AVHMI(pyglet.window.Window):
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
         self._last_detection_stamp = 0.0
+        self._last_detection_ego_yaw = 0.0
         self._ego_motion_local_estimate = [0.0, 0.0, 0.0]
         self._ego_speed_mps_estimate = 0.0
         self._ego_forward_speed_mps_estimate = 0.0
@@ -2153,29 +2202,15 @@ class AVHMI(pyglet.window.Window):
                 candidates.extend(self._lane_orientation_cells.get((base_x + dx, base_z + dz), []))
         return candidates if candidates else self._lane_orientation_segments
 
-    def _resolve_snapped_lane_yaw(self, reference_yaw, lane_yaw, allow_perpendicular):
+    def _resolve_snapped_lane_yaw(self, reference_yaw, lane_yaw):
         parallel_candidates = [lane_yaw, lane_yaw + math.pi]
         if reference_yaw is None:
             return parallel_candidates[0]
 
-        best_parallel = min(
+        return min(
             parallel_candidates,
             key=lambda yaw: abs(math.atan2(math.sin(yaw - reference_yaw), math.cos(yaw - reference_yaw))),
         )
-        if not allow_perpendicular:
-            return best_parallel
-
-        perpendicular_candidates = [lane_yaw + (math.pi * 0.5), lane_yaw - (math.pi * 0.5)]
-        best_perpendicular = min(
-            perpendicular_candidates,
-            key=lambda yaw: abs(math.atan2(math.sin(yaw - reference_yaw), math.cos(yaw - reference_yaw))),
-        )
-
-        parallel_error = abs(math.degrees(math.atan2(math.sin(best_parallel - reference_yaw), math.cos(best_parallel - reference_yaw))))
-        perpendicular_error = abs(math.degrees(math.atan2(math.sin(best_perpendicular - reference_yaw), math.cos(best_perpendicular - reference_yaw))))
-        if perpendicular_error + LANE_ORIENTATION_SWITCH_MARGIN_DEG < parallel_error:
-            return best_perpendicular
-        return best_parallel
 
     def _nearest_lane_snap_yaw(self, pose, entity: DetectedEntity):
         if not self._lane_orientation_segments:
@@ -2192,26 +2227,22 @@ class AVHMI(pyglet.window.Window):
         if best_segment is None or best_distance is None or best_distance > LANE_ORIENTATION_SNAP_DISTANCE_M:
             return None
 
-        speed = math.hypot(entity._ground_velocity_mps[0], entity._ground_velocity_mps[1])
-        allow_perpendicular = speed >= LANE_ORIENTATION_PERPENDICULAR_MIN_SPEED_MPS
         reference_yaw = entity.preferred_lane_reference_yaw()
-        return self._resolve_snapped_lane_yaw(reference_yaw, best_segment["yaw"], allow_perpendicular)
+        return self._resolve_snapped_lane_yaw(reference_yaw, best_segment["yaw"])
 
     def _snap_vehicle_orientations_to_lanes(self, active_ids=None):
-        if not self._lane_orientation_segments:
-            return
-
         entity_ids = active_ids if active_ids is not None else list(self.detected_entities.keys())
         for oid in entity_ids:
             entity = self.detected_entities.get(oid)
             if entity is None or entity.obj_class not in LANE_ORIENTATION_CLASSES or not entity._pose_initialized:
                 continue
 
-            pose = entity.target_local_pose if entity.target_local_pose else entity.local_pose
-            snapped_yaw = self._nearest_lane_snap_yaw(pose, entity)
-            if snapped_yaw is None:
+            if not self._lane_orientation_segments:
+                entity.snap_to_lane_yaw(None)
                 continue
-            entity.snap_to_lane_yaw(snapped_yaw)
+
+            pose = entity.target_local_pose if entity.target_local_pose else entity.local_pose
+            entity.snap_to_lane_yaw(self._nearest_lane_snap_yaw(pose, entity))
 
     def _sync_lane_lines(self, lanes: List[Dict[str, object]]):
         meshes = []
@@ -2236,9 +2267,10 @@ class AVHMI(pyglet.window.Window):
                 color=self._lane_color_for_type(line_type),
             )
             meshes.append(Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity()))
-            for idx in range(len(lane_points) - 1):
-                start = lane_points[idx]
-                end = lane_points[idx + 1]
+            orientation_points = resample_polyline_for_orientation(render_points, LANE_ORIENTATION_MIN_SEGMENT_M)
+            for idx in range(len(orientation_points) - 1):
+                start = orientation_points[idx]
+                end = orientation_points[idx + 1]
                 dx = end[0] - start[0]
                 dz = end[2] - start[2]
                 if math.hypot(dx, dz) < LANE_ORIENTATION_MIN_SEGMENT_M:
@@ -2355,7 +2387,8 @@ class AVHMI(pyglet.window.Window):
         if self._last_detection_stamp > 0.0:
             detection_dt = max(1e-3, time.perf_counter() - self._last_detection_stamp)
 
-        ego_motion_local = self._estimate_ego_motion_local(detections, detection_dt)
+        ego_delta_yaw = wrap_angle(self.ego.yaw - self._last_detection_ego_yaw)
+        ego_motion_local = self._estimate_ego_motion_local(detections, detection_dt, ego_delta_yaw)
         active_ids = set()
         for detection in detections:
             if not self._valid_detection(detection):
@@ -2381,7 +2414,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 entity.update(detection, actor=actor, actor_key=actor_key)
 
-            entity.set_local_pose(*local_pose, self.camera_origin_local, ego_motion_local, detection_dt)
+            entity.set_local_pose(*local_pose, self.camera_origin_local, ego_motion_local, ego_delta_yaw, detection_dt)
 
         if self._should_update_orientation_this_frame():
             self._apply_lane_consensus(active_ids)
@@ -2390,6 +2423,8 @@ class AVHMI(pyglet.window.Window):
         stale_ids = [oid for oid in self.detected_entities.keys() if oid not in active_ids]
         for oid in stale_ids:
             del self.detected_entities[oid]
+
+        self._last_detection_ego_yaw = self.ego.yaw
 
     def _apply_lane_consensus(self, active_ids):
         vehicle_ids = [
@@ -2430,7 +2465,7 @@ class AVHMI(pyglet.window.Window):
             consensus_yaw = math.atan2(avg_dx, -avg_dz)
             entity.apply_lane_consensus_yaw(consensus_yaw)
 
-    def _estimate_ego_motion_local(self, detections: List[Dict[str, float]], detection_dt: Optional[float]):
+    def _estimate_ego_motion_local(self, detections: List[Dict[str, float]], detection_dt: Optional[float], ego_delta_yaw: float):
         motion_samples_x = []
         motion_samples_z = []
 
@@ -2446,8 +2481,9 @@ class AVHMI(pyglet.window.Window):
                 continue
 
             local_pose = self._ros_detection_to_local_pose(detection)
-            dx = local_pose[0] - entity._raw_local_pose[0]
-            dz = local_pose[2] - entity._raw_local_pose[2]
+            prev_x, prev_z = rotate_local_xz(entity._raw_local_pose[0], entity._raw_local_pose[2], -ego_delta_yaw)
+            dx = local_pose[0] - prev_x
+            dz = local_pose[2] - prev_z
             motion_samples_x.append(-dx)
             motion_samples_z.append(-dz)
 
