@@ -2,6 +2,7 @@ numpy==2.0.1
 opencv-python-headless==4.11.0.86
 aioquic==1.2.0
 aiortc==1.11.0
-av==14.3.0
 wsproto==1.2.0
 starlette==0.46.2
+pillow==10.4.0
+pyglet==2.0.0
