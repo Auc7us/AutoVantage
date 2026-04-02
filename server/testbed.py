@@ -24,6 +24,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
 DETECTION_YAW_CORRECTION_DEG = -6.0
 DETECTION_LATERAL_OFFSET_M = -1.0
+VEHICLE_CENTER_CORRECTION_CLASSES = {1, 11, 13}
+VEHICLE_CENTER_HALF_LENGTH_M = 2.2
+VEHICLE_CENTER_HALF_WIDTH_M = 0.9
+VEHICLE_AXIS_MIN_STEP_M = 0.12
 
 
 def asset_path(*parts: str) -> str:
@@ -206,6 +210,10 @@ def mat4_scale(sx, sy, sz):
             0, sy,0, 0,
             0, 0, sz,0,
             0, 0, 0, 1]
+
+def lerp_angle(current, target, alpha):
+    delta = math.atan2(math.sin(target - current), math.cos(target - current))
+    return current + delta * alpha
 
 def perspective(fovy_deg, aspect, znear, zfar):
     f = 1.0 / math.tan(math.radians(fovy_deg)/2.0)
@@ -493,6 +501,13 @@ def recolor_car_mesh_colors(verts, source_colors, body_gray=(0.55, 0.57, 0.60)):
     return recolored
 
 
+def normalize_vec2(x, z):
+    mag = math.hypot(x, z)
+    if mag < 1e-6:
+        return 0.0, 0.0
+    return x / mag, z / mag
+
+
 class ObjectDetectionSubscriber(Node):
     def __init__(self, on_message, topic="/perception/objectdetection"):
         super().__init__("wautovantage_testbed_subscriber")
@@ -773,6 +788,8 @@ class DetectedEntity:
         self.local_pose = [0.0, 0.0, 0.0]
         self.target_local_pose = [0.0, 0.0, 0.0]
         self._pose_initialized = False
+        self._raw_local_pose = None
+        self._vehicle_axis_yaw = None
         self.last_seen = time.perf_counter()
 
     def update(self, detection: Dict[str, float], actor=None, actor_key=None):
@@ -784,12 +801,55 @@ class DetectedEntity:
         self.custom_classification = int(detection.get("custom_classification", 0))
         self.last_seen = time.perf_counter()
 
-    def set_local_pose(self, x: float, y: float, z: float):
-        new_pose = [x, y, z]
+    def set_local_pose(self, x: float, y: float, z: float, camera_origin_local):
+        raw_pose = [x, y, z]
+
+        if self.obj_class in VEHICLE_CENTER_CORRECTION_CLASSES:
+            self._update_vehicle_axis(raw_pose)
+            new_pose = self._vehicle_center_from_nearest_point(raw_pose, camera_origin_local)
+        else:
+            new_pose = raw_pose
+
         self.target_local_pose = new_pose
         if not self._pose_initialized:
             self.local_pose = list(new_pose)
             self._pose_initialized = True
+
+    def _update_vehicle_axis(self, raw_pose):
+        if self._raw_local_pose is not None:
+            dx = raw_pose[0] - self._raw_local_pose[0]
+            dz = raw_pose[2] - self._raw_local_pose[2]
+            if math.hypot(dx, dz) >= VEHICLE_AXIS_MIN_STEP_M:
+                target_yaw = math.atan2(dx, -dz)
+                if self._vehicle_axis_yaw is None:
+                    self._vehicle_axis_yaw = target_yaw
+                else:
+                    self._vehicle_axis_yaw = lerp_angle(self._vehicle_axis_yaw, target_yaw, 0.3)
+        self._raw_local_pose = list(raw_pose)
+
+    def _vehicle_center_from_nearest_point(self, raw_pose, camera_origin_local):
+        if self._vehicle_axis_yaw is None:
+            return raw_pose
+
+        cam_x, _cam_y, cam_z = camera_origin_local
+        los_x, los_z = normalize_vec2(raw_pose[0] - cam_x, raw_pose[2] - cam_z)
+        if los_x == 0.0 and los_z == 0.0:
+            return raw_pose
+
+        fwd_x = math.sin(self._vehicle_axis_yaw)
+        fwd_z = -math.cos(self._vehicle_axis_yaw)
+        right_x = math.cos(self._vehicle_axis_yaw)
+        right_z = math.sin(self._vehicle_axis_yaw)
+
+        longitudinal = abs((los_x * fwd_x) + (los_z * fwd_z))
+        lateral = abs((los_x * right_x) + (los_z * right_z))
+        shift = (VEHICLE_CENTER_HALF_LENGTH_M * longitudinal) + (VEHICLE_CENTER_HALF_WIDTH_M * lateral)
+
+        return [
+            raw_pose[0] + (los_x * shift),
+            raw_pose[1],
+            raw_pose[2] + (los_z * shift),
+        ]
 
     def apply_anchor(self, anchor_model):
         actor = self.actor
@@ -1359,7 +1419,7 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to create static car actor: {e}")
 
         # Lanes + grid
-        lane_pts = [[(off, 0.01, -float(s)) for s in range(0, 200, 2)] for off in (-1.75, 1.75)]
+        lane_pts = []
         
         self.tile_size   = 40.0      # meters per tile
         self.tile_step   = 2.0       # grid line spacing
@@ -1606,7 +1666,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 entity.update(detection, actor=actor, actor_key=actor_key)
 
-            entity.set_local_pose(*local_pose)
+            entity.set_local_pose(*local_pose, self.camera_origin_local)
 
         stale_ids = [oid for oid in self.detected_entities.keys() if oid not in active_ids]
         for oid in stale_ids:
