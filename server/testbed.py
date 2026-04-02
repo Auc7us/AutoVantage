@@ -1,12 +1,33 @@
 # Pyglet 2.1.9 • Modern OpenGL (core profile) • Textured OBJ support
 import math, time, ctypes, os
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import pyglet
 from pyglet.window import key, mouse
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from wauto_perception_msgs.msg import ObjectArray
+    ROS2_AVAILABLE = True
+except ImportError:
+    rclpy = None
+    Node = object
+    ObjectArray = None
+    ROS2_AVAILABLE = False
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
+DETECTION_YAW_CORRECTION_DEG = -6.0
+DETECTION_LATERAL_OFFSET_M = -1.0
+
+
+def asset_path(*parts: str) -> str:
+    return os.path.join(ASSETS_DIR, *parts)
 
 
 # ------------------------------------------------------------
@@ -179,6 +200,12 @@ def mat4_rotate_z(theta):
              s, c,0,0,
              0, 0,1,0,
              0, 0,0,1]
+
+def mat4_scale(sx, sy, sz):
+    return [sx,0, 0, 0,
+            0, sy,0, 0,
+            0, 0, sz,0,
+            0, 0, 0, 1]
 
 def perspective(fovy_deg, aspect, znear, zfar):
     f = 1.0 / math.tan(math.radians(fovy_deg)/2.0)
@@ -402,6 +429,148 @@ class Mesh:
     model: List[float]
     _tex_obj: Optional[pyglet.image.Texture] = None 
 
+
+def clone_mesh(mesh: Mesh) -> Mesh:
+    cloned = Mesh(
+        mesh.verts,
+        mesh.cols,
+        mesh.uvs,
+        mesh.texture_id,
+        mesh.mode,
+        mat4_identity(),
+        _tex_obj=mesh._tex_obj,
+    )
+    if hasattr(mesh, "_gpu"):
+        cloned._gpu = mesh._gpu
+    return cloned
+
+
+def colorize_barrel_mesh(verts):
+    if not verts:
+        return []
+
+    ys = [v[1] for v in verts]
+    ymin = min(ys)
+    ymax = max(ys)
+    yrange = max(1e-6, ymax - ymin)
+
+    orange = (0.95, 0.42, 0.08)
+    white = (0.96, 0.96, 0.96)
+    dark = (0.18, 0.18, 0.18)
+
+    colors = []
+    for _x, y, _z in verts:
+        t = (y - ymin) / yrange
+        if t < 0.08 or t > 0.92:
+            colors.append(dark)
+        elif 0.22 <= t <= 0.34 or 0.56 <= t <= 0.68:
+            colors.append(white)
+        else:
+            colors.append(orange)
+    return colors
+
+
+def solid_vertex_colors(verts, color):
+    return [color] * len(verts)
+
+
+def recolor_car_mesh_colors(verts, source_colors, body_gray=(0.55, 0.57, 0.60)):
+    if not verts:
+        return []
+
+    if not source_colors or len(source_colors) != len(verts):
+        source_colors = [(0.8, 0.2, 0.2)] * len(verts)
+
+    recolored = []
+    for r, g, b in source_colors:
+        # Replace the painted red body regions while leaving trim/glass/etc. alone.
+        if r > 0.45 and r > g * 1.2 and r > b * 1.2:
+            brightness = (r + g + b) / 3.0
+            shade = clamp(0.85 + (brightness - 0.4) * 0.6, 0.7, 1.05)
+            recolored.append(tuple(clamp(channel * shade, 0.0, 1.0) for channel in body_gray))
+        else:
+            recolored.append((r, g, b))
+    return recolored
+
+
+class ObjectDetectionSubscriber(Node):
+    def __init__(self, on_message, topic="/perception/objectdetection"):
+        super().__init__("wautovantage_testbed_subscriber")
+        self._on_message = on_message
+        self.subscription = self.create_subscription(
+            ObjectArray,
+            topic,
+            self._listener_callback,
+            10,
+        )
+
+    def _listener_callback(self, msg):
+        objects = []
+        for obj in msg.objects:
+            objects.append({
+                "object_id": int(obj.object_id),
+                "obj_class": int(obj.obj_class),
+                "custom_classification": int(obj.custom_classification),
+                "height": float(obj.height),
+                "width": float(obj.width),
+                "x": float(obj.x),
+                "y": float(obj.y),
+                "z": float(obj.z),
+            })
+        self._on_message(objects)
+
+
+class ROSObjectDetectionBridge:
+    def __init__(self, topic="/perception/objectdetection"):
+        self.topic = topic
+        self.enabled = False
+        self.node = None
+        self._latest_stamp = 0.0
+        self._latest_objects: List[Dict[str, float]] = []
+
+        if not ROS2_AVAILABLE:
+            print("ROS2 Python packages not available; object detection bridge disabled")
+            return
+
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            self.node = ObjectDetectionSubscriber(self._store_message, topic=topic)
+            self.enabled = True
+            print(f"Subscribed to ROS2 topic '{topic}'")
+        except Exception as exc:
+            print(f"Failed to initialize ROS2 bridge for '{topic}': {exc}")
+            self.enabled = False
+
+    def _store_message(self, objects):
+        self._latest_objects = objects
+        self._latest_stamp = time.perf_counter()
+
+    def spin_once(self):
+        if not self.enabled or self.node is None:
+            return
+        try:
+            rclpy.spin_once(self.node, timeout_sec=0.0)
+        except Exception as exc:
+            print(f"ROS2 spin_once failed: {exc}")
+            self.enabled = False
+
+    def latest_snapshot(self):
+        return self._latest_stamp, list(self._latest_objects)
+
+    def close(self):
+        if self.node is not None:
+            try:
+                self.node.destroy_node()
+            except Exception:
+                pass
+            self.node = None
+        if ROS2_AVAILABLE and rclpy and rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+
 class Ego:
     def __init__(self):
         self.pos  = [0.0, 0.0, 0.0]
@@ -594,6 +763,86 @@ class StreetSign:
         self.panel_mesh.model = Mp
 
 
+class DetectedEntity:
+    def __init__(self, detection: Dict[str, float], actor, actor_key):
+        self.object_id = int(detection["object_id"])
+        self.obj_class = int(detection["obj_class"])
+        self.custom_classification = int(detection.get("custom_classification", 0))
+        self.actor = actor
+        self.actor_key = actor_key
+        self.local_pose = [0.0, 0.0, 0.0]
+        self.target_local_pose = [0.0, 0.0, 0.0]
+        self._pose_initialized = False
+        self.last_seen = time.perf_counter()
+
+    def update(self, detection: Dict[str, float], actor=None, actor_key=None):
+        if actor is not None:
+            self.actor = actor
+        if actor_key is not None:
+            self.actor_key = actor_key
+        self.obj_class = int(detection["obj_class"])
+        self.custom_classification = int(detection.get("custom_classification", 0))
+        self.last_seen = time.perf_counter()
+
+    def set_local_pose(self, x: float, y: float, z: float):
+        new_pose = [x, y, z]
+        self.target_local_pose = new_pose
+        if not self._pose_initialized:
+            self.local_pose = list(new_pose)
+            self._pose_initialized = True
+
+    def apply_anchor(self, anchor_model):
+        actor = self.actor
+        if actor is None:
+            return
+
+        alpha = 0.28
+        for i in range(3):
+            self.local_pose[i] += (self.target_local_pose[i] - self.local_pose[i]) * alpha
+
+        local_model = mat4_translate(*self.local_pose)
+        world_model = mat4_mul(anchor_model, local_model)
+
+        if isinstance(actor, StreetSign):
+            actor.pole_mesh.model = world_model
+            ox, oy, oz = actor.panel_offset
+            panel_model = mat4_mul(world_model, mat4_translate(ox, oy, oz))
+            panel_model = mat4_mul(panel_model, mat4_rotate_x(math.radians(90.0)))
+            if getattr(actor, "yaw", 0.0) != 0.0:
+                panel_model = mat4_mul(panel_model, mat4_rotate_y(actor.yaw))
+            actor.panel_mesh.model = panel_model
+            return
+
+        if isinstance(actor, TrafficLight):
+            actor.mesh.model = world_model
+            return
+
+        if hasattr(actor, "mesh"):
+            actor.mesh.model = world_model
+        elif isinstance(actor, Mesh):
+            actor.model = world_model
+
+    def draw(self, renderer: "Renderer", pv):
+        actor = self.actor
+        if actor is None:
+            return
+
+        if isinstance(actor, StreetSign):
+            renderer.draw_mesh(actor.pole_mesh, pv)
+            renderer.draw_mesh(actor.panel_mesh, pv)
+            return
+
+        if isinstance(actor, TrafficLight):
+            renderer.draw_mesh(actor.mesh, pv)
+            return
+
+        if isinstance(actor, Mesh):
+            renderer.draw_mesh(actor, pv)
+            return
+
+        renderer.draw_mesh(actor.mesh, pv)
+
+
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
 # ------------------------------------------------------------
@@ -730,6 +979,14 @@ class Renderer:
         gl.glBindVertexArray(vao)
         gl.glDrawArrays(mode, 0, n)
 
+    def warm_mesh(self, mesh: Mesh):
+        if hasattr(mesh, "_gpu"):
+            return
+        if mesh.uvs is not None and mesh.texture_id is not None:
+            self._build_gpu_tex(mesh)
+        else:
+            self._build_gpu_color(mesh)
+
 
 # ------------------------------------------------------------
 # Texture helper
@@ -769,9 +1026,15 @@ class AVHMI(pyglet.window.Window):
         self.set_exclusive_mouse(False)
         self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
+        self.camera_origin_local = (0.0, 1.35, 0.0)
+        self.detected_entities: Dict[int, DetectedEntity] = {}
+        self.detected_mesh_templates: Dict[str, Mesh] = {}
+        self._last_detection_stamp = 0.0
+        self.ros_bridge = ROSObjectDetectionBridge()
+        self.detected_car_color = (0.55, 0.57, 0.60)
 
         self.ego = Ego()
-        car_obj_path = "assets/WAutoCar.obj"
+        car_obj_path = asset_path("WAutoCar.obj")
         self.car_mesh: Optional[Mesh] = None
         self.tex_normal = None
         self.tex_brake = None
@@ -804,8 +1067,8 @@ class AVHMI(pyglet.window.Window):
 
         # Wheels
         self.wheels = []
-        whl_R_obj_path = "assets/whl/whl_R.obj"
-        whl_L_obj_path = "assets/whl/whl_L.obj"
+        whl_R_obj_path = asset_path("whl", "whl_R.obj")
+        whl_L_obj_path = asset_path("whl", "whl_L.obj")
         try:
             wpos_r, wuv_r, wtex_r, wcol_r = load_obj_with_uv_mtl(whl_R_obj_path, scale=1.0, center_y=0.0) 
             wpos_l, wuv_l, wtex_l, wcol_l = load_obj_with_uv_mtl(whl_L_obj_path, scale=1.0, center_y=0.0)
@@ -871,7 +1134,7 @@ class AVHMI(pyglet.window.Window):
 
         # Human Model
         self.characters: List[MovingCharacter] = []
-        human_obj_path = "assets/human/human.obj"
+        human_obj_path = asset_path("human", "human.obj")
         try:
             hpos, huv, htex, hcol = load_obj_with_uv_mtl(human_obj_path, scale=1.0, center_y=0.0)
             if hpos:
@@ -894,6 +1157,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 cols = hcol if hcol else [(0.8, 0.7, 0.6)] * len(hpos_scaled)
                 hmesh = Mesh(hpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            self.detected_mesh_templates["human"] = clone_mesh(hmesh)
             self.characters.append(MovingCharacter(hmesh, 2.0, 0.0, -8.0))
             try:
                 tris = len(hpos_scaled)//3
@@ -904,12 +1168,13 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to load human '{human_obj_path}': {e}")
             v, c = make_box_triangles(0.6, 1.8, 0.4, (0.8, 0.7, 0.6))
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(2.0, 0.0, -8.0))
+            self.detected_mesh_templates["human"] = clone_mesh(fallback)
 
             self.characters.append(MovingCharacter(fallback, 2.0, 0.0, -8.0))
 
         # Barrel Model
         try:
-            barrel_obj_path = "assets/barrel/barrel.obj"
+            barrel_obj_path = asset_path("barrel", "barrel.obj")
             bpos, buv, btex, bcol = load_obj_with_uv_mtl(barrel_obj_path, scale=1.0, center_y=0.0)
             if bpos:
                 ys = [p[1] for p in bpos]
@@ -921,31 +1186,26 @@ class AVHMI(pyglet.window.Window):
             else:
                 bpos_scaled = bpos
 
-            if buv and btex:
-                tex_obj = create_texture_2d(btex)
-                if tex_obj:
-                    bmesh = Mesh(bpos_scaled, bcol, buv, tex_obj.id, gl.GL_TRIANGLES, mat4_translate(4.0, 0.0, -8.0), _tex_obj=tex_obj)
-                else:
-                    cols = bcol if bcol else [(0.5, 0.3, 0.1)] * len(bpos_scaled) # Brown color
-                    bmesh = Mesh(bpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(4.0, 0.0, -8.0))
-            else:
-                cols = bcol if bcol else [(0.5, 0.3, 0.1)] * len(bpos_scaled) # Brown color
-                bmesh = Mesh(bpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(4.0, 0.0, -8.0))
+            cols = colorize_barrel_mesh(bpos_scaled) if bpos_scaled else [(0.95, 0.42, 0.08)]
+            bmesh = Mesh(bpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(4.0, 0.0, -8.0))
+            self.detected_mesh_templates["barrel"] = clone_mesh(bmesh)
             self.obstacles.append(StaticObject(bmesh))
             try:
                 tris = len(bpos_scaled)//3
             except Exception:
                 tris = 0
-            print(f"Loaded barrel model: {tris} tris (scale {s:.3f} -> height {desired_h} m)")
+            print(f"Loaded barrel model: {tris} tris (scale {s:.3f} -> height {desired_h} m, orange/white striped)")
         except Exception as e:
             print(f"WARNING: failed to load barrel '{barrel_obj_path}': {e}")
-            v, c = make_box_triangles(0.6, 1.0, 0.6, (0.5, 0.3, 0.1)) # Fallback brown box
+            v, _c = make_box_triangles(0.6, 1.0, 0.6, (0.95, 0.42, 0.08))
+            c = colorize_barrel_mesh(v)
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(4.0, 0.0, -8.0))
+            self.detected_mesh_templates["barrel"] = clone_mesh(fallback)
             self.obstacles.append(StaticObject(fallback))
 
         # Traffic Cone Model
         try:
-            cone_obj_path = "assets/traffic-cone/cone.obj"
+            cone_obj_path = asset_path("traffic-cone", "cone.obj")
             cpos, cuv, ctex, ccol = load_obj_with_uv_mtl(cone_obj_path, scale=1.0, center_y=0.0)
             if cpos:
                 ys = [p[1] for p in cpos]
@@ -967,6 +1227,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 cols = ccol if ccol else [(0.9, 0.4, 0.1)] * len(cpos_scaled)  # Orange color
                 cmesh = Mesh(cpos_scaled, cols, None, None, gl.GL_TRIANGLES, mat4_translate(5.0, 0.0, -8.0))
+            self.detected_mesh_templates["cone"] = clone_mesh(cmesh)
             self.obstacles.append(StaticObject(cmesh))
             try:
                 tris = len(cpos_scaled)//3
@@ -977,11 +1238,12 @@ class AVHMI(pyglet.window.Window):
             print(f"WARNING: failed to load traffic cone '{cone_obj_path}': {e}")
             v, c = make_box_triangles(0.4, 1.0, 0.4, (0.9, 0.4, 0.1))  # Fallback orange box
             fallback = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(5.0, 0.0, -8.0))
+            self.detected_mesh_templates["cone"] = clone_mesh(fallback)
             self.obstacles.append(StaticObject(fallback))
 
         # Deer Model
         try:
-            deer_obj_path = "assets/deer/deer.obj"
+            deer_obj_path = asset_path("deer", "deer.obj")
             dpos, duv, dtex, dcol = [], None, None, None
             try:
                 dpos, duv, dtex, dcol = load_obj_with_uv_mtl(deer_obj_path, scale=1.0, center_y=0.0)
@@ -1009,6 +1271,7 @@ class AVHMI(pyglet.window.Window):
                 deer_mesh = Mesh(dpos_scaled, cols, duv, None, gl.GL_TRIANGLES, mat4_translate(10.0, 0.0, -8.0))
             
             if deer_mesh:
+                self.detected_mesh_templates["deer"] = clone_mesh(deer_mesh)
                 self.characters.append(MovingCharacter(deer_mesh, 10.0, 0.0, -8.0))
                 try:
                     tris = len(dpos_scaled)//3
@@ -1018,6 +1281,7 @@ class AVHMI(pyglet.window.Window):
             else:
                 v, c = make_box_triangles(1.2, 0.8, 0.4, (0.6, 0.4, 0.2))
                 fb = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(10.0, 0.0, -8.0))
+                self.detected_mesh_templates["deer"] = clone_mesh(fb)
                 self.characters.append(MovingCharacter(fb, 10.0, 0.0, -8.0))
                 print("Deer OBJ present but failed to build mesh — added fallback box at x=10.0")
         except Exception as e:
@@ -1026,7 +1290,7 @@ class AVHMI(pyglet.window.Window):
         # Surrounding Car Model
         self.vehicles = []
         try:
-            car_obj_path = "assets/car/car.obj"
+            car_obj_path = asset_path("car", "car.obj")
             cpos, cuv, ctex, ccol = None, None, None, None
             try:
                 cpos, cuv, ctex, ccol = load_obj_with_uv_mtl(car_obj_path, scale=1.0, center_y=0.0)
@@ -1040,14 +1304,10 @@ class AVHMI(pyglet.window.Window):
                 desired_h = 1.4
                 s = desired_h / model_h
                 cpos_scaled = [(x*s, (y - cymin)*s, z*s) for (x, y, z) in cpos]
-
-                if cuv and ctex and os.path.isfile(ctex):
-                    ctex_obj = create_texture_2d(ctex)
-                    car_mesh = Mesh(cpos_scaled, ccol, cuv, (ctex_obj.id if ctex_obj else None), gl.GL_TRIANGLES, mat4_translate(-2.0, 0.0, -8.0), _tex_obj=(ctex_obj if ctex_obj else None))
-                else:
-                    cols = ccol if ccol else [(0.8, 0.2, 0.2)] * len(cpos_scaled)
-                    car_mesh = Mesh(cpos_scaled, cols, cuv, None, gl.GL_TRIANGLES, mat4_translate(-2.0, 0.0, -8.0))
+                gray_cols = recolor_car_mesh_colors(cpos_scaled, ccol, self.detected_car_color)
+                car_mesh = Mesh(cpos_scaled, gray_cols, None, None, gl.GL_TRIANGLES, mat4_translate(-2.0, 0.0, -8.0))
                 
+                self.detected_mesh_templates["car"] = clone_mesh(car_mesh)
                 self.vehicles.append(MovingCharacter(car_mesh, -2.0, 0.0, -8.0))
                 try:
                     ctris = len(cpos_scaled)//3
@@ -1059,7 +1319,7 @@ class AVHMI(pyglet.window.Window):
 
         # Car
         try:
-            car_obj_path = "assets/car/car.obj"
+            car_obj_path = asset_path("car", "car.obj")
             cpos, cuv, ctex, ccol = None, None, None, None
             try:
                 cpos, cuv, ctex, ccol = load_obj_with_uv_mtl(car_obj_path, scale=1.0, center_y=0.0)
@@ -1087,17 +1347,11 @@ class AVHMI(pyglet.window.Window):
 
                 # Position it next to the truck
                 car_x, car_y, car_z = -7, 0.0, -8.0
+                gray_cols = recolor_car_mesh_colors(cpos_scaled, ccol, self.detected_car_color)
+                car_mesh = Mesh(cpos_scaled, gray_cols, None, None, gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z))
 
-                if cuv and ctex and os.path.isfile(ctex):
-                    ctex_obj = create_texture_2d(ctex)
-                    car_mesh = Mesh(cpos_scaled, ccol, cuv, (ctex_obj.id if ctex_obj else None), gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z), _tex_obj=(ctex_obj if ctex_obj else None))
-                else:
-                    if ccol:
-                        car_mesh = Mesh(cpos_scaled, ccol, cuv, None, gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z))
-                    else:
-                        fallback_cols = [(0.2, 0.5, 0.8)] * len(cpos_scaled) # Blue-ish
-                        car_mesh = Mesh(cpos_scaled, fallback_cols, cuv, None, gl.GL_TRIANGLES, mat4_translate(car_x, car_y, car_z))
-
+                if "car" not in self.detected_mesh_templates:
+                    self.detected_mesh_templates["car"] = clone_mesh(car_mesh)
                 self.characters.append(MovingCharacter(car_mesh, car_x, car_y, car_z))
                 ctris = len(cpos_scaled)//3
                 print(f"Loaded car model from '{car_obj_path}': {ctris} tris (scale {s:.6f} -> height {desired_h} m) centered at ({car_x}, {car_y}, {car_z})")
@@ -1145,12 +1399,14 @@ class AVHMI(pyglet.window.Window):
 
         # Camera (initialize behind the car)
         self.cam_yawoff = math.pi / 2.0
-        self.cam_pitch  = math.radians(60.0)
-        self.cam_dist   = 12.0
-        self.cam_height = 4.0
+        self.cam_pitch  = math.radians(48.0)
+        self.cam_dist   = 6.5
+        self.cam_height = 2.5
 
         self.renderer = Renderer()
+        self._warm_detected_templates()
         self.last_time = time.perf_counter()
+        self._disable_demo_detection_actors()
         pyglet.clock.schedule_interval(self.update, 1.0/self.fps)
 
 
@@ -1190,6 +1446,172 @@ class AVHMI(pyglet.window.Window):
         for key in to_delete:
             del self.grid_tiles[key]
 
+    def _disable_demo_detection_actors(self):
+        self.show_obstacles = False
+        self.obstacles = []
+        self.characters = []
+        self.vehicles = []
+        self.street_signs = []
+        self.traffic_light = None
+
+    def _warm_detected_templates(self):
+        for mesh in self.detected_mesh_templates.values():
+            self.renderer.warm_mesh(mesh)
+
+    def _valid_dimension(self, value: float) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(value) and 0.01 < value < 1000.0
+
+    def _default_height_for_class(self, obj_class: int) -> float:
+        return {
+            1: 1.5,
+            2: 1.8,
+            3: 1.6,
+            4: 1.0,
+            5: 3.0,
+            6: 2.0,
+            7: 1.0,
+            9: 0.75,
+            11: 3.0,
+            12: 1.4,
+            13: 3.2,
+            14: 1.5,
+            15: 3.5,
+            16: 1.8,
+        }.get(obj_class, 1.0)
+
+    def _valid_detection(self, detection: Dict[str, float]) -> bool:
+        if int(detection.get("object_id", 255)) == 255:
+            return False
+        if int(detection.get("obj_class", 255)) == 255:
+            return False
+        coords = (detection.get("x"), detection.get("y"), detection.get("z"))
+        return all(isinstance(v, (int, float)) and math.isfinite(v) and abs(v) < 9000.0 for v in coords)
+
+    def _ros_detection_to_local_pose(self, detection: Dict[str, float]) -> List[float]:
+        # ZED is configured as RIGHT_HANDED_Z_UP_X_FWD:
+        # x = forward, y = left, z = up
+        forward = float(detection["x"])
+        left = float(detection["y"])
+        up = float(detection["z"])
+        cam_x, cam_y, cam_z = self.camera_origin_local
+
+        # Apply a small fixed sensor-frame yaw correction before mapping into the
+        # testbed's local coordinates. Negative is clockwise from top-down view.
+        right = -left
+        theta = math.radians(DETECTION_YAW_CORRECTION_DEG)
+        c = math.cos(theta)
+        s = math.sin(theta)
+        corrected_right = (right * c) - (forward * s)
+        corrected_forward = (right * s) + (forward * c)
+
+        obj_height = float(detection.get("height", 0.0))
+        if not self._valid_dimension(obj_height):
+            obj_height = self._default_height_for_class(int(detection["obj_class"]))
+
+        world_x = cam_x + corrected_right + DETECTION_LATERAL_OFFSET_M
+        world_y = max(0.0, cam_y + up - (obj_height * 0.5))
+        world_z = cam_z - corrected_forward
+        return [world_x, world_y, world_z]
+
+    def _make_mesh_actor(self, mesh: Mesh):
+        return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
+
+    def _actor_key_for_detection(self, detection: Dict[str, float]):
+        obj_class = int(detection["obj_class"])
+        custom = int(detection.get("custom_classification", 0))
+        if obj_class == 6:
+            if custom == 5:
+                return (obj_class, "stop")
+            if custom == 9:
+                return (obj_class, "yield")
+            return (obj_class, "speed")
+        return (obj_class,)
+
+    def _build_fallback_actor(self, obj_class: int, detection: Dict[str, float]):
+        height = float(detection.get("height", 0.0))
+        width = float(detection.get("width", 0.0))
+        if not self._valid_dimension(height):
+            height = self._default_height_for_class(obj_class)
+        if not self._valid_dimension(width):
+            width = max(0.4, height * 0.5)
+        depth = max(0.4, min(4.0, width * 1.4))
+        colors = {
+            1: (0.2, 0.5, 0.8),
+            4: (1.0, 0.5, 0.0),
+            5: (0.3, 0.3, 0.3),
+            6: (0.9, 0.9, 0.9),
+            7: (0.55, 0.35, 0.15),
+            9: (0.95, 0.45, 0.1),
+            11: (0.55, 0.55, 0.7),
+            12: (0.2, 0.8, 0.2),
+            13: (0.9, 0.8, 0.2),
+            14: (0.8, 0.2, 0.2),
+            15: (0.55, 0.55, 0.55),
+            16: (0.8, 0.7, 0.6),
+        }
+        v, c = make_box_triangles(width, height, depth, colors.get(obj_class, (0.7, 0.7, 0.7)))
+        mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_identity())
+        return MovingCharacter(mesh, 0.0, 0.0, 0.0)
+
+    def _build_detected_actor(self, detection: Dict[str, float]):
+        obj_class = int(detection["obj_class"])
+        custom = int(detection.get("custom_classification", 0))
+
+        if obj_class == 1 and "car" in self.detected_mesh_templates:
+            return self._make_mesh_actor(self.detected_mesh_templates["car"])
+        if obj_class in (2, 12, 14, 16) and "human" in self.detected_mesh_templates:
+            return self._make_mesh_actor(self.detected_mesh_templates["human"])
+        if obj_class == 3 and "deer" in self.detected_mesh_templates:
+            return self._make_mesh_actor(self.detected_mesh_templates["deer"])
+        if obj_class == 4:
+            return MovingBarricade(0.0, 0.0, 0.0)
+        if obj_class == 5:
+            return TrafficLight(0.0, 0.0, 0.0)
+        if obj_class == 6:
+            sign_kind = "speed"
+            if custom == 5:
+                sign_kind = "stop"
+            elif custom == 9:
+                sign_kind = "yield"
+            return StreetSign(sign_kind, 0.0, 0.0, 0.0, yaw=math.pi)
+        if obj_class == 7 and "barrel" in self.detected_mesh_templates:
+            return self._make_mesh_actor(self.detected_mesh_templates["barrel"])
+        if obj_class == 9 and "cone" in self.detected_mesh_templates:
+            return self._make_mesh_actor(self.detected_mesh_templates["cone"])
+        return self._build_fallback_actor(obj_class, detection)
+
+    def _sync_detected_entities(self, detections: List[Dict[str, float]]):
+        active_ids = set()
+        for detection in detections:
+            if not self._valid_detection(detection):
+                continue
+
+            object_id = int(detection["object_id"])
+            active_ids.add(object_id)
+            local_pose = self._ros_detection_to_local_pose(detection)
+            detection = dict(detection)
+            detection["local_pose"] = local_pose
+            actor_key = self._actor_key_for_detection(detection)
+
+            entity = self.detected_entities.get(object_id)
+            actor_changed = (
+                entity is None
+                or entity.actor_key != actor_key
+            )
+            actor = self._build_detected_actor(detection) if actor_changed else None
+
+            if entity is None:
+                entity = DetectedEntity(detection, actor, actor_key)
+                self.detected_entities[object_id] = entity
+            else:
+                entity.update(detection, actor=actor, actor_key=actor_key)
+
+            entity.set_local_pose(*local_pose)
+
+        stale_ids = [oid for oid in self.detected_entities.keys() if oid not in active_ids]
+        for oid in stale_ids:
+            del self.detected_entities[oid]
+
     # Input
     def on_mouse_press(self, x, y, button, modifiers):
         if button == mouse.LEFT:
@@ -1211,6 +1633,12 @@ class AVHMI(pyglet.window.Window):
         now = time.perf_counter()
         dt = clamp(now - self.last_time, 0.0, 1.0/60.0)
         self.last_time = now
+
+        self.ros_bridge.spin_once()
+        detection_stamp, detections = self.ros_bridge.latest_snapshot()
+        if detection_stamp > self._last_detection_stamp:
+            self._sync_detected_entities(detections)
+            self._last_detection_stamp = detection_stamp
 
         throttle  = 1.0 if self.keys[key.W] else 0.0
         brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
@@ -1236,7 +1664,8 @@ class AVHMI(pyglet.window.Window):
         for ss in self.street_signs:
             ss.update(dt)
         # update traffic light
-        self.traffic_light.update(dt)
+        if self.traffic_light is not None:
+            self.traffic_light.update(dt)
 
 
 
@@ -1247,9 +1676,7 @@ class AVHMI(pyglet.window.Window):
         proj = perspective(60.0, max(1e-6, self.width/float(self.height)), 0.1, 500.0)
 
         # Camera mount point
-        cam_mount_local_x = 0.0  # centered laterally
-        cam_mount_local_y = 1.65  # on top of windshield
-        cam_mount_local_z = -0.5  # forward from center (negative Z is forward)
+        cam_mount_local_x, cam_mount_local_y, cam_mount_local_z = self.camera_origin_local
         
         # Transform camera mount to world space based on vehicle rotation
         c = math.cos(self.ego.yaw)
@@ -1311,7 +1738,8 @@ class AVHMI(pyglet.window.Window):
                 self.renderer.draw_mesh(o.mesh, pv)
 
         # Draw traffic light
-        self.renderer.draw_mesh(self.traffic_light.mesh, pv)
+        if self.traffic_light is not None:
+            self.renderer.draw_mesh(self.traffic_light.mesh, pv)
 
         # Draw street signs
         for ss in self.street_signs:
@@ -1322,11 +1750,20 @@ class AVHMI(pyglet.window.Window):
         for ch in self.characters:
             self.renderer.draw_mesh(ch.mesh, pv)
 
-        self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
+        for entity in self.detected_entities.values():
+            entity.apply_anchor(car_M)
+            entity.draw(self.renderer, pv)
+
+        ros_status = "ROS2 OK" if self.ros_bridge.enabled else "ROS2 OFF"
+        self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg   {ros_status}   Objects {len(self.detected_entities)}"
         self.hud.draw()
         
         if hasattr(self, 'streaming'):
             self.streaming.push_frame()
+
+    def on_close(self):
+        self.ros_bridge.close()
+        super().on_close()
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
