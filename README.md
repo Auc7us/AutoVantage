@@ -2,13 +2,31 @@
 
 ## Latest - How to Run Testbed.py for Autonomous Simulation
 
-Run these commands:
+1. Run these commands:
 ```bash
-    python -m venv .wav
-    .wav/Scripts/activate
-    pip install pyglet
-    python server/testbed.py
+git clone https://github.com/WisconsinAutonomous/WAutoVantage.git
+python -m venv .wav
+.wav/Scripts/activate
+pip install pyglet
+python server/testbed.py
 ```
+
+### Jetson Streaming Integration
+
+**Prerequisites:**
+- NVIDIA Jetson
+- FFmpeg installed with NVENC support (`hevc_nvenc`)
+
+**How to Use:**
+1. The streaming module initializes automatically if FFmpeg and NVENC are available when running the simulation.
+2. The simulation streams H.265 video via RTP to `127.0.0.1:5004`. Change this to proper IP address when testing between devices.
+
+Open a new bash terminal and type in this command:
+```bash
+ffplay -protocol_whitelist file,rtp,udp -i stream.sdp
+```
+
+You should be able to view a 2nd stream that follows the vehicle's movements in the testbed environment.
 
 ## Overview
 
