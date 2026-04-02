@@ -25,9 +25,24 @@ ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
 DETECTION_YAW_CORRECTION_DEG = -6.0
 DETECTION_LATERAL_OFFSET_M = -1.0
 VEHICLE_CENTER_CORRECTION_CLASSES = {1, 11, 13}
+LANE_CONSENSUS_CLASSES = {1, 11, 13}
 VEHICLE_CENTER_HALF_LENGTH_M = 2.2
 VEHICLE_CENTER_HALF_WIDTH_M = 0.9
 VEHICLE_AXIS_MIN_STEP_M = 0.12
+STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10}
+MOTION_HEADING_CLASSES = {1, 2, 11, 13, 16}
+HEADING_SMOOTH_ALPHA = 0.3
+HEADING_CONFIRM_FRAMES = 5
+HEADING_UPDATE_DEG = 8.0
+HEADING_MOTION_MIN_STEP_M = 0.10
+HEADING_HISTORY_SIZE = 6
+MOTION_HEADING_MESH_OFFSET_DEG = 180.0
+LANE_LATERAL_THRESHOLD_M = 2.2
+LANE_LONGITUDINAL_LOOKAHEAD_M = 60.0
+LANE_CONSENSUS_MIN_NEIGHBORS = 2
+LANE_CONSENSUS_BLEND_ALPHA = 0.22
+SPEED_ROLLING_WINDOW = 12
+MPS_TO_MPH = 2.23693629
 
 
 def asset_path(*parts: str) -> str:
@@ -508,6 +523,17 @@ def normalize_vec2(x, z):
     return x / mag, z / mag
 
 
+def median(values):
+    if not values:
+        return 0.0
+    values = sorted(values)
+    n = len(values)
+    mid = n // 2
+    if n % 2:
+        return values[mid]
+    return 0.5 * (values[mid - 1] + values[mid])
+
+
 class ObjectDetectionSubscriber(Node):
     def __init__(self, on_message, topic="/perception/objectdetection"):
         super().__init__("wautovantage_testbed_subscriber")
@@ -789,7 +815,8 @@ class DetectedEntity:
         self.target_local_pose = [0.0, 0.0, 0.0]
         self._pose_initialized = False
         self._raw_local_pose = None
-        self._vehicle_axis_yaw = None
+        self._motion_yaw = None
+        self._ground_motion_history = []
         self.last_seen = time.perf_counter()
 
     def update(self, detection: Dict[str, float], actor=None, actor_key=None):
@@ -801,11 +828,11 @@ class DetectedEntity:
         self.custom_classification = int(detection.get("custom_classification", 0))
         self.last_seen = time.perf_counter()
 
-    def set_local_pose(self, x: float, y: float, z: float, camera_origin_local):
+    def set_local_pose(self, x: float, y: float, z: float, camera_origin_local, ego_motion_local):
         raw_pose = [x, y, z]
+        self._update_motion_heading(raw_pose, ego_motion_local)
 
         if self.obj_class in VEHICLE_CENTER_CORRECTION_CLASSES:
-            self._update_vehicle_axis(raw_pose)
             new_pose = self._vehicle_center_from_nearest_point(raw_pose, camera_origin_local)
         else:
             new_pose = raw_pose
@@ -815,20 +842,42 @@ class DetectedEntity:
             self.local_pose = list(new_pose)
             self._pose_initialized = True
 
-    def _update_vehicle_axis(self, raw_pose):
+    def _update_motion_heading(self, raw_pose, ego_motion_local):
         if self._raw_local_pose is not None:
             dx = raw_pose[0] - self._raw_local_pose[0]
             dz = raw_pose[2] - self._raw_local_pose[2]
-            if math.hypot(dx, dz) >= VEHICLE_AXIS_MIN_STEP_M:
-                target_yaw = math.atan2(dx, -dz)
-                if self._vehicle_axis_yaw is None:
-                    self._vehicle_axis_yaw = target_yaw
-                else:
-                    self._vehicle_axis_yaw = lerp_angle(self._vehicle_axis_yaw, target_yaw, 0.3)
+            ground_dx = dx + ego_motion_local[0]
+            ground_dz = dz + ego_motion_local[2]
+            if self.obj_class in MOTION_HEADING_CLASSES and math.hypot(ground_dx, ground_dz) >= HEADING_MOTION_MIN_STEP_M:
+                self._ground_motion_history.append((ground_dx, ground_dz))
+                if len(self._ground_motion_history) > HEADING_HISTORY_SIZE:
+                    self._ground_motion_history.pop(0)
+
+                if len(self._ground_motion_history) >= HEADING_CONFIRM_FRAMES:
+                    avg_dx = sum(v[0] for v in self._ground_motion_history) / len(self._ground_motion_history)
+                    avg_dz = sum(v[1] for v in self._ground_motion_history) / len(self._ground_motion_history)
+                    if math.hypot(avg_dx, avg_dz) < HEADING_MOTION_MIN_STEP_M:
+                        self._raw_local_pose = list(raw_pose)
+                        return
+
+                    target_yaw = math.atan2(avg_dx, -avg_dz)
+                    target_yaw += math.radians(MOTION_HEADING_MESH_OFFSET_DEG)
+                    if self._motion_yaw is None:
+                        self._motion_yaw = target_yaw
+                    else:
+                        delta_current = abs(math.degrees(math.atan2(
+                            math.sin(target_yaw - self._motion_yaw),
+                            math.cos(target_yaw - self._motion_yaw),
+                        )))
+                        if delta_current >= HEADING_UPDATE_DEG:
+                            self._motion_yaw = lerp_angle(self._motion_yaw, target_yaw, HEADING_SMOOTH_ALPHA)
+            else:
+                if self._ground_motion_history:
+                    self._ground_motion_history.pop(0)
         self._raw_local_pose = list(raw_pose)
 
     def _vehicle_center_from_nearest_point(self, raw_pose, camera_origin_local):
-        if self._vehicle_axis_yaw is None:
+        if self._motion_yaw is None:
             return raw_pose
 
         cam_x, _cam_y, cam_z = camera_origin_local
@@ -836,10 +885,10 @@ class DetectedEntity:
         if los_x == 0.0 and los_z == 0.0:
             return raw_pose
 
-        fwd_x = math.sin(self._vehicle_axis_yaw)
-        fwd_z = -math.cos(self._vehicle_axis_yaw)
-        right_x = math.cos(self._vehicle_axis_yaw)
-        right_z = math.sin(self._vehicle_axis_yaw)
+        fwd_x = math.sin(self._motion_yaw)
+        fwd_z = -math.cos(self._motion_yaw)
+        right_x = math.cos(self._motion_yaw)
+        right_z = math.sin(self._motion_yaw)
 
         longitudinal = abs((los_x * fwd_x) + (los_z * fwd_z))
         lateral = abs((los_x * right_x) + (los_z * right_z))
@@ -878,9 +927,27 @@ class DetectedEntity:
             return
 
         if hasattr(actor, "mesh"):
+            if self.obj_class in MOTION_HEADING_CLASSES and self._motion_yaw is not None:
+                world_model = mat4_mul(mat4_translate(world_model[12], world_model[13], world_model[14]), mat4_rotate_y(self._motion_yaw))
             actor.mesh.model = world_model
         elif isinstance(actor, Mesh):
             actor.model = world_model
+
+    def average_ground_motion(self):
+        if len(self._ground_motion_history) < HEADING_CONFIRM_FRAMES:
+            return None
+        avg_dx = sum(v[0] for v in self._ground_motion_history) / len(self._ground_motion_history)
+        avg_dz = sum(v[1] for v in self._ground_motion_history) / len(self._ground_motion_history)
+        if math.hypot(avg_dx, avg_dz) < HEADING_MOTION_MIN_STEP_M:
+            return None
+        return avg_dx, avg_dz
+
+    def apply_lane_consensus_yaw(self, consensus_yaw):
+        consensus_yaw += math.radians(MOTION_HEADING_MESH_OFFSET_DEG)
+        if self._motion_yaw is None:
+            self._motion_yaw = consensus_yaw
+            return
+        self._motion_yaw = lerp_angle(self._motion_yaw, consensus_yaw, LANE_CONSENSUS_BLEND_ALPHA)
 
     def draw(self, renderer: "Renderer", pv):
         actor = self.actor
@@ -1086,10 +1153,22 @@ class AVHMI(pyglet.window.Window):
         self.set_exclusive_mouse(False)
         self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
+        self.speed_hud = pyglet.text.Label(
+            "",
+            font_name="Roboto",
+            font_size=20,
+            x=width // 2,
+            y=height - 28,
+            anchor_x="center",
+            anchor_y="center",
+        )
         self.camera_origin_local = (0.0, 1.35, 0.0)
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
         self._last_detection_stamp = 0.0
+        self._ego_motion_local_estimate = [0.0, 0.0, 0.0]
+        self._ego_speed_mps_estimate = 0.0
+        self._ego_speed_mph_history = []
         self.ros_bridge = ROSObjectDetectionBridge()
         self.detected_car_color = (0.55, 0.57, 0.60)
 
@@ -1641,6 +1720,11 @@ class AVHMI(pyglet.window.Window):
         return self._build_fallback_actor(obj_class, detection)
 
     def _sync_detected_entities(self, detections: List[Dict[str, float]]):
+        detection_dt = None
+        if self._last_detection_stamp > 0.0:
+            detection_dt = max(1e-3, time.perf_counter() - self._last_detection_stamp)
+
+        ego_motion_local = self._estimate_ego_motion_local(detections, detection_dt)
         active_ids = set()
         for detection in detections:
             if not self._valid_detection(detection):
@@ -1666,11 +1750,92 @@ class AVHMI(pyglet.window.Window):
             else:
                 entity.update(detection, actor=actor, actor_key=actor_key)
 
-            entity.set_local_pose(*local_pose, self.camera_origin_local)
+            entity.set_local_pose(*local_pose, self.camera_origin_local, ego_motion_local)
+
+        self._apply_lane_consensus(active_ids)
 
         stale_ids = [oid for oid in self.detected_entities.keys() if oid not in active_ids]
         for oid in stale_ids:
             del self.detected_entities[oid]
+
+    def _apply_lane_consensus(self, active_ids):
+        vehicle_ids = [
+            oid for oid in active_ids
+            if oid in self.detected_entities and self.detected_entities[oid].obj_class in LANE_CONSENSUS_CLASSES
+        ]
+
+        for oid in vehicle_ids:
+            entity = self.detected_entities[oid]
+            if not entity._pose_initialized:
+                continue
+
+            neighbor_vectors = []
+            ex, _, ez = entity.target_local_pose
+            for other_id in vehicle_ids:
+                other = self.detected_entities[other_id]
+                if not other._pose_initialized:
+                    continue
+                ox, _, oz = other.target_local_pose
+                if abs(ox - ex) > LANE_LATERAL_THRESHOLD_M:
+                    continue
+                if abs(oz - ez) > LANE_LONGITUDINAL_LOOKAHEAD_M:
+                    continue
+
+                avg_motion = other.average_ground_motion()
+                if avg_motion is None:
+                    continue
+                neighbor_vectors.append(avg_motion)
+
+            if len(neighbor_vectors) < LANE_CONSENSUS_MIN_NEIGHBORS:
+                continue
+
+            avg_dx = sum(v[0] for v in neighbor_vectors) / len(neighbor_vectors)
+            avg_dz = sum(v[1] for v in neighbor_vectors) / len(neighbor_vectors)
+            if math.hypot(avg_dx, avg_dz) < HEADING_MOTION_MIN_STEP_M:
+                continue
+
+            consensus_yaw = math.atan2(avg_dx, -avg_dz)
+            entity.apply_lane_consensus_yaw(consensus_yaw)
+
+    def _estimate_ego_motion_local(self, detections: List[Dict[str, float]], detection_dt: Optional[float]):
+        motion_samples_x = []
+        motion_samples_z = []
+
+        for detection in detections:
+            if not self._valid_detection(detection):
+                continue
+            if int(detection["obj_class"]) not in STATIC_REFERENCE_CLASSES:
+                continue
+
+            object_id = int(detection["object_id"])
+            entity = self.detected_entities.get(object_id)
+            if entity is None or entity._raw_local_pose is None:
+                continue
+
+            local_pose = self._ros_detection_to_local_pose(detection)
+            dx = local_pose[0] - entity._raw_local_pose[0]
+            dz = local_pose[2] - entity._raw_local_pose[2]
+            motion_samples_x.append(-dx)
+            motion_samples_z.append(-dz)
+
+        if motion_samples_x and motion_samples_z:
+            measured = [median(motion_samples_x), 0.0, median(motion_samples_z)]
+            alpha = 0.35
+            self._ego_motion_local_estimate[0] += (measured[0] - self._ego_motion_local_estimate[0]) * alpha
+            self._ego_motion_local_estimate[2] += (measured[2] - self._ego_motion_local_estimate[2]) * alpha
+            if detection_dt is not None:
+                forward_speed = abs(self._ego_motion_local_estimate[2]) / detection_dt
+                self._ego_speed_mps_estimate += (forward_speed - self._ego_speed_mps_estimate) * 0.25
+                self._ego_speed_mph_history.append(self._ego_speed_mps_estimate * MPS_TO_MPH)
+                if len(self._ego_speed_mph_history) > SPEED_ROLLING_WINDOW:
+                    self._ego_speed_mph_history.pop(0)
+        else:
+            self._ego_motion_local_estimate[0] *= 0.85
+            self._ego_motion_local_estimate[2] *= 0.85
+            # Keep the last known speed when static references drop out briefly.
+            self._ego_speed_mps_estimate *= 0.995
+
+        return list(self._ego_motion_local_estimate)
 
     # Input
     def on_mouse_press(self, x, y, button, modifiers):
@@ -1815,7 +1980,15 @@ class AVHMI(pyglet.window.Window):
             entity.draw(self.renderer, pv)
 
         ros_status = "ROS2 OK" if self.ros_bridge.enabled else "ROS2 OFF"
-        self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg   {ros_status}   Objects {len(self.detected_entities)}"
+        avg_speed_mph = (
+            sum(self._ego_speed_mph_history) / len(self._ego_speed_mph_history)
+            if self._ego_speed_mph_history else self._ego_speed_mps_estimate * MPS_TO_MPH
+        )
+        self.hud.text = f"Sim Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg   {ros_status}   Objects {len(self.detected_entities)}"
+        self.speed_hud.x = self.width // 2
+        self.speed_hud.y = self.height - 28
+        self.speed_hud.text = f"Estimated Speed {avg_speed_mph:4.1f} mph"
+        self.speed_hud.draw()
         self.hud.draw()
         
         if hasattr(self, 'streaming'):
