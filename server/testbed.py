@@ -1190,7 +1190,7 @@ class StreetSign:
             width - (border_inset * 2.0),
             height - (border_inset * 2.0),
             thickness * 0.7,
-            color=(1.0, 1.0, 1.0),
+            color=(0.9, 0.08, 0.08) if kind == "stop" else (1.0, 1.0, 1.0),
             radius=max(0.04, corner_radius - border_inset * 0.65),
         )
         self.pole_mesh = Mesh(border_verts, border_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
