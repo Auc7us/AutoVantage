@@ -1,5 +1,5 @@
 """
-Integration module for adding H.265 streaming to the testbed.py application
+Integration module for adding H.264 streaming to the testbed.py application
 """
 
 import sys
@@ -39,11 +39,11 @@ class StreamingIntegration:
             )
             
             if self.streamer.is_active:
-                print(f"✓ H.265 streaming initialized successfully")
+                print(f"✓ H.264 streaming initialized successfully")
                 print(f"  → RTP: {self.rtp_host}:{self.rtp_port}")
                 print(f"  → SDP: stream.sdp")
             else:
-                print("✗ H.265 streaming initialization failed")
+                print("✗ H.264 streaming initialization failed")
                 print("  → Check FFmpeg and NVENC installation")
                 
         except Exception as e:
@@ -86,7 +86,7 @@ class StreamingIntegration:
     def stop(self):
         if self.streamer:
             self.streamer.stop()
-            print("H.265 streaming stopped")
+            print("H.264 streaming stopped")
 
 
 def integrate_with_testbed():
@@ -102,7 +102,7 @@ def integrate_with_testbed():
 
 
 if __name__ == "__main__":
-    print("Testing H.265 Streaming Integration")
+    print("Testing H.264 Streaming Integration")
     print("=" * 40)
     
     streaming = StreamingIntegration()

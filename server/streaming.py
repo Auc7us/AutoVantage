@@ -1,8 +1,9 @@
 """
-Hardware-accelerated H.265 streaming module using FFmpeg + NVENC
+Hardware-accelerated H.264 streaming module using FFmpeg + NVENC
 Designed for NVIDIA Jetson testing with RTP output
 """
 
+import base64
 import subprocess
 import threading
 import time
@@ -25,7 +26,8 @@ class H265Streamer:
         self.is_active = False
         self.proc = None
         self.worker = None
-        self.frame_queue = queue.Queue(maxsize=30)
+        # Keep the queue shallow so motion stays current instead of buffering stale frames.
+        self.frame_queue = queue.Queue(maxsize=2)
         
         # Frame timing
         self._frame_interval = 1.0 / fps
@@ -42,11 +44,11 @@ class H265Streamer:
 
         # Select the best available encoder
         if self._check_nvenc_availability():
-            self.encoder = 'hevc_nvenc'
-            self.logger.info("Using Hardware Encoder: hevc_nvenc")
+            self.encoder = 'h264_nvenc'
+            self.logger.info("Using Hardware Encoder: h264_nvenc")
         else:
-            self.encoder = 'libx265'
-            self.logger.info("NVENC hardware encoder not found. falling back to Software Encoder: libx265")
+            self.encoder = 'libx264'
+            self.logger.info("NVENC hardware encoder not found. falling back to Software Encoder: libx264")
             
         # Start streaming
         self._start_streaming()
@@ -74,13 +76,13 @@ class H265Streamer:
                 text=True
             )
             
-            if 'hevc_nvenc' not in result.stdout:
-                self.logger.error("NVENC H.265 encoder not found in FFmpeg binary")
+            if 'h264_nvenc' not in result.stdout:
+                self.logger.error("NVENC H.264 encoder not found in FFmpeg binary")
                 return False
         
             test_cmd = [
-                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'testsrc=s=64x64:r=1', 
-                '-t', '1', '-c:v', 'hevc_nvenc', '-f', 'null', '-'
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'testsrc=s=64x64:r=1',
+                '-t', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'
             ]
             test_result = subprocess.run(test_cmd, capture_output=True)
             
@@ -96,6 +98,9 @@ class H265Streamer:
             return False
     
     def _start_streaming(self):
+        self._cleanup_sdp_files()
+        self._create_sdp_file()
+
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',  
@@ -108,25 +113,12 @@ class H265Streamer:
             '-vf', 'vflip,format=yuv420p',
         ]
         
-        if self.encoder == 'hevc_nvenc':
-            ffmpeg_cmd.extend([
-                '-c:v', 'hevc_nvenc',
-                '-preset', 'p1',
-                '-tune', 'ull',
-                '-zerolatency', '1',
-                '-b:v', '5000k'
-            ])
-        else:
-            ffmpeg_cmd.extend([
-                '-c:v', 'libx265',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-x265-params', 'keyint=15:min-keyint=15:repeat-headers=1'
-            ])
+        ffmpeg_cmd.extend(self._encoder_args())
             
         ffmpeg_cmd.extend([
+            '-bsf:v', 'dump_extra=freq=keyframe',
             '-f', 'rtp',
-            f'rtp://{self.rtp_host}:{self.rtp_port}'
+            f'rtp://{self.rtp_host}:{self.rtp_port}?pkt_size=1200'
         ])
         
         try:
@@ -138,37 +130,141 @@ class H265Streamer:
                 bufsize=0
             )
             
-            self._create_sdp_file()
             self.is_active = True
             
             self.worker = threading.Thread(target=self._write_worker, daemon=True)
             self.worker.start()
             
             self.logger.info(f"Streaming started: RTP to {self.rtp_host}:{self.rtp_port}")
-            self.logger.info(f"SDP file created: stream.sdp")
+            self.logger.info("SDP file created: stream.sdp")
             
         except Exception as e:
             self.logger.error(f"Failed to start streaming: {e}")
             self.is_active = False
+
+    def _encoder_args(self):
+        if self.encoder == 'h264_nvenc':
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',
+                '-tune', 'ull',
+                '-aud', '1',
+                '-zerolatency', '1',
+                '-b:v', '5000k',
+                '-g', '30',
+                '-bf', '0',
+                '-forced-idr', '1'
+            ]
+
+        return [
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-g', '30',
+            '-bf', '0',
+            '-x264-params', 'keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:aud=1'
+        ]
+
+    def _cleanup_sdp_files(self):
+        for path in ("stream.sdp", "stream.sdp.tmp"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                self.logger.warning("Failed to remove stale %s: %s", path, e)
     
     def _create_sdp_file(self):
+        fmtp_parts = ['packetization-mode=1']
+        sps, pps = self._probe_h264_parameter_sets()
+        if sps and pps:
+            if len(sps) >= 4:
+                fmtp_parts.append(f'profile-level-id={sps[1:4].hex()}')
+            fmtp_parts.append(
+                'sprop-parameter-sets='
+                f'{base64.b64encode(sps).decode("ascii")},'
+                f'{base64.b64encode(pps).decode("ascii")}'
+            )
+
         sdp_content = f"""v=0
 o=- 0 0 IN IP4 {self.rtp_host}
-s=H265 Streaming
+s=H264 Streaming
 c=IN IP4 {self.rtp_host}
 t=0 0
 m=video {self.rtp_port} RTP/AVP 96
-a=rtpmap:96 H265/90000
-a=fmtp:96 profile-level-id=64001f;packetization-mode=1
+a=rtpmap:96 H264/90000
+a=fmtp:96 {';'.join(fmtp_parts)}
 a=framesize:96 {self.width}-{self.height}
 """
         
         try:
-            with open("stream.sdp", "w") as f:
+            temp_path = "stream.sdp.tmp"
+            with open(temp_path, "w") as f:
                 f.write(sdp_content)
+            os.replace(temp_path, "stream.sdp")
             self.logger.info("SDP file created successfully")
         except Exception as e:
             self.logger.error(f"Failed to create SDP file: {e}")
+
+    def _probe_h264_parameter_sets(self):
+        probe_cmd = [
+            'ffmpeg',
+            '-loglevel', 'error',
+            '-y',
+            '-f', 'lavfi',
+            '-i', f'color=c=black:s={self.width}x{self.height}:r={self.fps}',
+            '-frames:v', '1',
+            '-vf', 'format=yuv420p',
+        ]
+        probe_cmd.extend(self._encoder_args())
+        probe_cmd.extend([
+            '-f', 'h264',
+            '-'
+        ])
+
+        try:
+            result = subprocess.run(probe_cmd, capture_output=True, check=True)
+            sps, pps = self._extract_h264_parameter_sets(result.stdout)
+            if not sps or not pps:
+                self.logger.warning("Failed to extract H.264 SPS/PPS from probe stream")
+            return sps, pps
+        except subprocess.CalledProcessError as e:
+            self.logger.warning("Failed to probe H.264 parameter sets: %s", e.stderr.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            self.logger.warning("Unexpected error while probing H.264 parameter sets: %s", e)
+        return None, None
+
+    def _extract_h264_parameter_sets(self, bitstream: bytes):
+        start_codes = []
+        i = 0
+        while i < len(bitstream) - 3:
+            if bitstream[i:i + 4] == b'\x00\x00\x00\x01':
+                start_codes.append((i, 4))
+                i += 4
+                continue
+            if bitstream[i:i + 3] == b'\x00\x00\x01':
+                start_codes.append((i, 3))
+                i += 3
+                continue
+            i += 1
+
+        sps = None
+        pps = None
+        for idx, (start, prefix_len) in enumerate(start_codes):
+            nal_start = start + prefix_len
+            nal_end = start_codes[idx + 1][0] if idx + 1 < len(start_codes) else len(bitstream)
+            nal = bitstream[nal_start:nal_end]
+            if not nal:
+                continue
+            nal_type = nal[0] & 0x1F
+            if nal_type == 7 and sps is None:
+                sps = nal
+            elif nal_type == 8 and pps is None:
+                pps = nal
+            if sps and pps:
+                break
+
+        return sps, pps
     
     def _write_worker(self):
         while self.is_active:
@@ -193,7 +289,12 @@ a=framesize:96 {self.width}-{self.height}
                 self.frame_queue.put_nowait(frame_data)
                 self._last_push = current_time
             except queue.Full:
-                pass
+                try:
+                    self.frame_queue.get_nowait()
+                    self.frame_queue.put_nowait(frame_data)
+                    self._last_push = current_time
+                except queue.Empty:
+                    pass
     
     def stop(self):
         self.is_active = False
@@ -217,7 +318,7 @@ a=framesize:96 {self.width}-{self.height}
 
 
 def main():
-    print("H.265 NVENC Streaming Module")
+    print("H.264 NVENC Streaming Module")
     print("=" * 40)
     
     streamer = H265Streamer(
