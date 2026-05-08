@@ -23,13 +23,10 @@ except ImportError:
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
-DETECTION_YAW_CORRECTION_DEG = -6.0
+DETECTION_YAW_CORRECTION_DEG = 0.0
 DETECTION_LATERAL_OFFSET_M = -1.0
 DETECTION_YAW_CORRECTION_RAD = math.radians(DETECTION_YAW_CORRECTION_DEG)
-VEHICLE_CENTER_CORRECTION_CLASSES = {1, 11, 13}
 LANE_CONSENSUS_CLASSES = {1, 11, 13}
-VEHICLE_CENTER_HALF_LENGTH_M = 2.2
-VEHICLE_CENTER_HALF_WIDTH_M = 0.9
 VEHICLE_AXIS_MIN_STEP_M = 0.12
 STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10}
 MOTION_HEADING_CLASSES = {1, 2, 11, 13, 16}
@@ -71,6 +68,25 @@ GROUND_SPEED_FRESHNESS_SEC = 0.45
 
 def asset_path(*parts: str) -> str:
     return os.path.join(ASSETS_DIR, *parts)
+
+
+def read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using default {default}")
+        return default
+
+
+def read_str_env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
 
 
 # ------------------------------------------------------------
@@ -1244,16 +1260,9 @@ class DetectedEntity:
         filtered_pose = self._filter_local_pose(raw_pose, detection_dt)
         motion_pose = self._tracked_local_pose if self._tracked_local_pose is not None else filtered_pose
         self._update_motion_heading(motion_pose, ego_motion_local, ego_delta_yaw, detection_dt)
-        resolved_yaw = self._refresh_render_yaw()
-
-        if self.obj_class in VEHICLE_CENTER_CORRECTION_CLASSES:
-            new_pose = self._vehicle_center_from_nearest_point(filtered_pose, camera_origin_local, motion_yaw=resolved_yaw)
-        else:
-            new_pose = filtered_pose
-
-        self.target_local_pose = new_pose
+        self.target_local_pose = filtered_pose
         if not self._pose_initialized:
-            self.local_pose = list(new_pose)
+            self.local_pose = list(filtered_pose)
             self._pose_initialized = True
         self._raw_local_pose = list(raw_pose)
 
@@ -1344,31 +1353,6 @@ class DetectedEntity:
         self._render_yaw = lerp_angle(self._render_yaw, target_yaw, blend_alpha)
         return self._render_yaw
 
-    def _vehicle_center_from_nearest_point(self, raw_pose, camera_origin_local, motion_yaw: Optional[float] = None):
-        motion_yaw = self._motion_yaw if motion_yaw is None else motion_yaw
-        if motion_yaw is None:
-            return raw_pose
-
-        cam_x, _cam_y, cam_z = camera_origin_local
-        los_x, los_z = normalize_vec2(raw_pose[0] - cam_x, raw_pose[2] - cam_z)
-        if los_x == 0.0 and los_z == 0.0:
-            return raw_pose
-
-        fwd_x = math.sin(motion_yaw)
-        fwd_z = -math.cos(motion_yaw)
-        right_x = math.cos(motion_yaw)
-        right_z = math.sin(motion_yaw)
-
-        longitudinal = abs((los_x * fwd_x) + (los_z * fwd_z))
-        lateral = abs((los_x * right_x) + (los_z * right_z))
-        shift = (VEHICLE_CENTER_HALF_LENGTH_M * longitudinal) + (VEHICLE_CENTER_HALF_WIDTH_M * lateral)
-
-        return [
-            raw_pose[0] + (los_x * shift),
-            raw_pose[1],
-            raw_pose[2] + (los_z * shift),
-        ]
-
     def apply_anchor(self, anchor_model):
         actor = self.actor
         if actor is None:
@@ -1397,9 +1381,6 @@ class DetectedEntity:
             return
 
         if hasattr(actor, "mesh"):
-            resolved_yaw = self._refresh_render_yaw()
-            if self.obj_class in MOTION_HEADING_CLASSES and resolved_yaw is not None:
-                local_model = mat4_mul(local_model, mat4_rotate_y(resolved_yaw))
             world_model = mat4_mul(anchor_model, local_model)
             actor.mesh.model = world_model
         elif isinstance(actor, Mesh):
@@ -1643,7 +1624,7 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 
 
 class AVHMI(pyglet.window.Window):
-    def __init__(self, width=1280, height=720, fps=60):
+    def __init__(self, width=640, height=360, fps=60):
         cfg = gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3)
         super().__init__(width=width, height=height, caption="HMI 3D", resizable=True, config=cfg)
         self.fps = fps
@@ -2696,21 +2677,34 @@ class AVHMI(pyglet.window.Window):
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
+    stream_fps = read_int_env("WAUTOVANTAGE_STREAM_FPS", 24)
+    stream_queue_size = read_int_env("WAUTOVANTAGE_STREAM_QUEUE_SIZE", 1)
+    stream_keyframe_interval = read_int_env(
+        "WAUTOVANTAGE_STREAM_GOP",
+        max(10, stream_fps // 2)
+    )
+    stream_mode = read_str_env("WAUTOVANTAGE_STREAM_MODE", "mpegts").lower()
+    stream_host = read_str_env("WAUTOVANTAGE_STREAM_HOST", "127.0.0.1")
+    stream_port_default = 5000 if stream_mode == "mpegts" else 5004
+    stream_port = read_int_env("WAUTOVANTAGE_STREAM_PORT", stream_port_default)
     try:
         from streaming_integration import StreamingIntegration
         streaming = StreamingIntegration(
-            width=1280,
-            height=720,
-            fps=30,
-            rtp_host="127.0.0.1",
-            rtp_port=5004
+            width=640,
+            height=360,
+            fps=stream_fps,
+            rtp_host=stream_host,
+            rtp_port=stream_port,
+            queue_size=stream_queue_size,
+            keyframe_interval=stream_keyframe_interval,
+            stream_mode=stream_mode
         )
     except ImportError:
         print("Streaming module not available - running without streaming")
         streaming = None
     
     # Create and run the main window
-    window = AVHMI(1280, 720, 60)
+    window = AVHMI(640, 360, 60)
     
     if streaming:
         window.streaming = streaming

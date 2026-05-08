@@ -14,20 +14,30 @@ from typing import Optional
 
 class H265Streamer:
     
-    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30, 
-                 rtp_host: str = "127.0.0.1", rtp_port: int = 5004):
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30,
+                 rtp_host: str = "127.0.0.1", rtp_port: int = 5000,
+                 queue_size: int = 1, keyframe_interval: Optional[int] = None,
+                 stream_mode: str = "mpegts"):
         self.width = width
         self.height = height
         self.fps = fps
         self.rtp_host = rtp_host
         self.rtp_port = rtp_port
+        self.queue_size = max(1, queue_size)
+        normalized_mode = stream_mode.strip().lower()
+        self.stream_mode = normalized_mode if normalized_mode in {"mpegts", "rtp"} else "mpegts"
+        default_keyframe_interval = max(10, fps // 2) if fps > 1 else 10
+        if keyframe_interval is None:
+            self.keyframe_interval = default_keyframe_interval
+        else:
+            self.keyframe_interval = max(1, keyframe_interval)
         
         # Streaming state
         self.is_active = False
         self.proc = None
         self.worker = None
         # Keep the queue shallow so motion stays current instead of buffering stale frames.
-        self.frame_queue = queue.Queue(maxsize=2)
+        self.frame_queue = queue.Queue(maxsize=self.queue_size)
         
         # Frame timing
         self._frame_interval = 1.0 / fps
@@ -98,8 +108,11 @@ class H265Streamer:
             return False
     
     def _start_streaming(self):
-        self._cleanup_sdp_files()
-        self._create_sdp_file()
+        if self.stream_mode == "rtp":
+            self._cleanup_sdp_files()
+            self._create_sdp_file()
+        else:
+            self._cleanup_sdp_files()
 
         ffmpeg_cmd = [
             'ffmpeg',
@@ -114,12 +127,21 @@ class H265Streamer:
         ]
         
         ffmpeg_cmd.extend(self._encoder_args())
-            
-        ffmpeg_cmd.extend([
-            '-bsf:v', 'dump_extra=freq=keyframe',
-            '-f', 'rtp',
-            f'rtp://{self.rtp_host}:{self.rtp_port}?pkt_size=1200'
-        ])
+
+        if self.stream_mode == "rtp":
+            ffmpeg_cmd.extend([
+                '-bsf:v', 'dump_extra=freq=keyframe',
+                '-f', 'rtp',
+                f'rtp://{self.rtp_host}:{self.rtp_port}?pkt_size=1200'
+            ])
+        else:
+            ffmpeg_cmd.extend([
+                '-flush_packets', '1',
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-f', 'mpegts',
+                f'udp://{self.rtp_host}:{self.rtp_port}?pkt_size=1316'
+            ])
         
         try:
             self.proc = subprocess.Popen(
@@ -134,9 +156,16 @@ class H265Streamer:
             
             self.worker = threading.Thread(target=self._write_worker, daemon=True)
             self.worker.start()
-            
-            self.logger.info(f"Streaming started: RTP to {self.rtp_host}:{self.rtp_port}")
-            self.logger.info("SDP file created: stream.sdp")
+
+            if self.stream_mode == "rtp":
+                self.logger.info(f"Streaming started: RTP to {self.rtp_host}:{self.rtp_port}")
+                self.logger.info("SDP file created: stream.sdp")
+            else:
+                self.logger.info(
+                    "Streaming started: MPEG-TS over UDP to %s:%s",
+                    self.rtp_host,
+                    self.rtp_port,
+                )
             
         except Exception as e:
             self.logger.error(f"Failed to start streaming: {e}")
@@ -151,7 +180,7 @@ class H265Streamer:
                 '-aud', '1',
                 '-zerolatency', '1',
                 '-b:v', '5000k',
-                '-g', '30',
+                '-g', str(self.keyframe_interval),
                 '-bf', '0',
                 '-forced-idr', '1'
             ]
@@ -160,9 +189,11 @@ class H265Streamer:
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-g', '30',
+            '-g', str(self.keyframe_interval),
             '-bf', '0',
-            '-x264-params', 'keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:aud=1'
+            '-x264-params',
+            f'keyint={self.keyframe_interval}:min-keyint={self.keyframe_interval}:'
+            'scenecut=0:repeat-headers=1:aud=1'
         ]
 
     def _cleanup_sdp_files(self):
@@ -326,14 +357,18 @@ def main():
         height=720,
         fps=30,
         rtp_host="127.0.0.1",
-        rtp_port=5004
+        rtp_port=5000,
+        stream_mode="mpegts"
     )
     
     if not streamer.is_active:
         print("Streaming not available - check FFmpeg and NVENC installation")
         return
     
-    print(f"Streaming to RTP: {streamer.rtp_host}:{streamer.rtp_port}")
+    if streamer.stream_mode == "rtp":
+        print(f"Streaming to RTP: {streamer.rtp_host}:{streamer.rtp_port}")
+    else:
+        print(f"Streaming to UDP/MPEG-TS: {streamer.rtp_host}:{streamer.rtp_port}")
     print("Press Ctrl+C to stop")
     
     try:

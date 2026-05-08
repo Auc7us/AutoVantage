@@ -37,11 +37,18 @@ sudo docker run -it --rm \
   bash -i
 ```
 
+In a separate host terminal, start MediaMTX:
+
+```bash
+~/mediamtx ~/simple.yml
+```
+
 ## Inside The Container
 
 If you only want to run the visualizer with no ROS topic subscription:
 
 ```bash
+cd /workspace/WAutoVantage
 python3 server/testbed.py
 ```
 
@@ -57,3 +64,22 @@ python3 server/testbed.py
 ```
 
 You do not need a full `colcon build` of `WAutoVision` just to subscribe to remote topics. `WAutoVantage` only needs `rclpy` plus `wauto_perception_msgs`.
+
+## Streaming Notes
+
+`testbed.py` now starts the FFmpeg publisher itself and sends MPEG-TS directly to MediaMTX on `127.0.0.1:5000`. You do not need the old `stream.sdp` bridge command anymore.
+
+Optional stream tuning before `python3 server/testbed.py`:
+
+```bash
+export WAUTOVANTAGE_STREAM_FPS=24
+export WAUTOVANTAGE_STREAM_QUEUE_SIZE=1
+export WAUTOVANTAGE_STREAM_GOP=12
+```
+
+Optional compatibility fallback to the old RTP/SDP mode:
+
+```bash
+export WAUTOVANTAGE_STREAM_MODE=rtp
+export WAUTOVANTAGE_STREAM_PORT=5004
+```

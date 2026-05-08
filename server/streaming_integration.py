@@ -15,12 +15,17 @@ import pyglet.gl as gl
 
 class StreamingIntegration:
     def __init__(self, width: int = 1280, height: int = 720, fps: int = 30,
-                 rtp_host: str = "127.0.0.1", rtp_port: int = 5004):
+                 rtp_host: str = "127.0.0.1", rtp_port: int = 5000,
+                 queue_size: int = 1, keyframe_interval: Optional[int] = None,
+                 stream_mode: str = "mpegts"):
         self.width = width
         self.height = height
         self.fps = fps
         self.rtp_host = rtp_host
         self.rtp_port = rtp_port
+        self.queue_size = queue_size
+        self.keyframe_interval = keyframe_interval
+        self.stream_mode = stream_mode
         
         self.streamer: Optional[H265Streamer] = None
         self._last_push = time.perf_counter()
@@ -35,13 +40,19 @@ class StreamingIntegration:
                 height=self.height,
                 fps=self.fps,
                 rtp_host=self.rtp_host,
-                rtp_port=self.rtp_port
+                rtp_port=self.rtp_port,
+                queue_size=self.queue_size,
+                keyframe_interval=self.keyframe_interval,
+                stream_mode=self.stream_mode
             )
             
             if self.streamer.is_active:
                 print(f"✓ H.264 streaming initialized successfully")
-                print(f"  → RTP: {self.rtp_host}:{self.rtp_port}")
-                print(f"  → SDP: stream.sdp")
+                if self.stream_mode == "rtp":
+                    print(f"  → RTP: {self.rtp_host}:{self.rtp_port}")
+                    print(f"  → SDP: stream.sdp")
+                else:
+                    print(f"  → UDP/MPEG-TS: {self.rtp_host}:{self.rtp_port}")
             else:
                 print("✗ H.264 streaming initialization failed")
                 print("  → Check FFmpeg and NVENC installation")
@@ -95,7 +106,8 @@ def integrate_with_testbed():
         height=720,
         fps=30,
         rtp_host="127.0.0.1",
-        rtp_port=5004
+        rtp_port=5000,
+        stream_mode="mpegts"
     )
     
     return streaming
@@ -105,7 +117,7 @@ if __name__ == "__main__":
     print("Testing H.264 Streaming Integration")
     print("=" * 40)
     
-    streaming = StreamingIntegration()
+    streaming = StreamingIntegration(stream_mode="mpegts")
     
     if streaming.streamer and streaming.streamer.is_active:
         print("Integration test successful - streaming ready")
