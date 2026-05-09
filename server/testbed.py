@@ -1,5 +1,6 @@
 # Pyglet 2.1.9 • Modern OpenGL (core profile) • Textured OBJ support
-import math, time, ctypes, os
+import math, time, ctypes, os, threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -92,12 +93,80 @@ def read_int_env(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def read_float_env(name: str, default: float, minimum: Optional[float] = None) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using default {default}")
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def read_str_env(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
         return default
     value = value.strip()
     return value if value else default
+
+
+class FrameProfiler:
+    def __init__(self, enabled: bool = False, interval_sec: float = 2.0):
+        self.enabled = enabled
+        self.interval_sec = max(0.25, interval_sec)
+        self._last_report = time.perf_counter()
+        self._frames = 0
+        self._totals: Dict[str, float] = {}
+        self._counts: Dict[str, int] = {}
+
+    @contextmanager
+    def section(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - start)
+
+    def add(self, name: str, elapsed_sec: float):
+        if not self.enabled:
+            return
+        self._totals[name] = self._totals.get(name, 0.0) + elapsed_sec
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+    def frame(self):
+        if not self.enabled:
+            return
+        self._frames += 1
+        now = time.perf_counter()
+        elapsed = now - self._last_report
+        if elapsed < self.interval_sec:
+            return
+
+        fps = self._frames / max(1e-6, elapsed)
+        parts = [f"fps={fps:5.1f}"]
+        for name in sorted(self._totals):
+            count = max(1, self._counts.get(name, 1))
+            parts.append(f"{name}={self._totals[name] * 1000.0 / count:5.2f}ms")
+        print("[profile] " + "  ".join(parts))
+        self._last_report = now
+        self._frames = 0
+        self._totals.clear()
+        self._counts.clear()
 
 
 # ------------------------------------------------------------
@@ -342,6 +411,23 @@ out vec3 v_col;
 void main(){
     v_col = in_col;
     gl_Position = u_mvp * vec4(in_pos, 1.0);
+}
+"""
+
+VERT_COLOR_INSTANCED = """
+#version 330
+layout(location = 0) in vec3 in_pos;
+layout(location = 1) in vec3 in_col;
+layout(location = 2) in vec4 in_model_col0;
+layout(location = 3) in vec4 in_model_col1;
+layout(location = 4) in vec4 in_model_col2;
+layout(location = 5) in vec4 in_model_col3;
+uniform mat4 u_proj_view;
+out vec3 v_col;
+void main(){
+    v_col = in_col;
+    mat4 in_model = mat4(in_model_col0, in_model_col1, in_model_col2, in_model_col3);
+    gl_Position = u_proj_view * in_model * vec4(in_pos, 1.0);
 }
 """
 
@@ -1336,6 +1422,9 @@ class ROSPerceptionBridge:
     ):
         self.enabled = False
         self.node = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._spin_thread = None
         self._latest_object_stamp = 0.0
         self._latest_lane_stamp = 0.0
         self._latest_stopbar_stamp = 0.0
@@ -1363,49 +1452,70 @@ class ROSPerceptionBridge:
                 driveable_polygon_topic=driveable_polygon_topic,
             )
             self.enabled = True
+            self._spin_thread = threading.Thread(
+                target=self._spin_loop,
+                name="wautovantage-ros-spin",
+                daemon=True,
+            )
+            self._spin_thread.start()
             print(f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', '{stopbar_topic}', and '{driveable_polygon_topic}'")
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
             self.enabled = False
 
     def _store_objects(self, objects):
-        self._latest_objects = objects
-        self._latest_object_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_objects = objects
+            self._latest_object_stamp = time.perf_counter()
 
     def _store_lanes(self, lanes):
-        self._latest_lanes = lanes
-        self._latest_lane_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_lanes = lanes
+            self._latest_lane_stamp = time.perf_counter()
 
     def _store_stopbar(self, depth):
-        self._latest_stopbar_depth = depth
-        self._latest_stopbar_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_stopbar_depth = depth
+            self._latest_stopbar_stamp = time.perf_counter()
 
     def _store_driveable_polygon(self, points):
-        self._latest_driveable_polygon = points
-        self._latest_driveable_polygon_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_driveable_polygon = points
+            self._latest_driveable_polygon_stamp = time.perf_counter()
+
+    def _spin_loop(self):
+        while not self._stop_event.is_set() and self.enabled and self.node is not None:
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+            except Exception as exc:
+                print(f"ROS2 perception spin_once failed: {exc}")
+                self.enabled = False
+                break
 
     def spin_once(self):
-        if not self.enabled or self.node is None:
-            return
-        try:
-            rclpy.spin_once(self.node, timeout_sec=0.0)
-        except Exception as exc:
-            print(f"ROS2 perception spin_once failed: {exc}")
-            self.enabled = False
+        return
 
     def latest_object_snapshot(self):
-        return self._latest_object_stamp, list(self._latest_objects)
+        with self._lock:
+            return self._latest_object_stamp, list(self._latest_objects)
 
     def latest_lane_snapshot(self):
-        return self._latest_lane_stamp, list(self._latest_lanes)
+        with self._lock:
+            return self._latest_lane_stamp, list(self._latest_lanes)
 
     def latest_stopbar_snapshot(self):
-        return self._latest_stopbar_stamp, self._latest_stopbar_depth
+        with self._lock:
+            return self._latest_stopbar_stamp, self._latest_stopbar_depth
 
     def latest_driveable_polygon_snapshot(self):
-        return self._latest_driveable_polygon_stamp, list(self._latest_driveable_polygon)
+        with self._lock:
+            return self._latest_driveable_polygon_stamp, list(self._latest_driveable_polygon)
 
     def close(self):
+        self._stop_event.set()
+        if self._spin_thread is not None and self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=1.0)
+            self._spin_thread = None
         if self.node is not None:
             try:
                 self.node.destroy_node()
@@ -1920,48 +2030,66 @@ class DetectedEntity:
 class Renderer:
     def __init__(self):
         self.prog_color = ShaderProgram(Shader(VERT_COLOR, 'vertex'), Shader(FRAG_COLOR, 'fragment'))
+        self.prog_color_inst = ShaderProgram(Shader(VERT_COLOR_INSTANCED, 'vertex'), Shader(FRAG_COLOR, 'fragment'))
         self.prog_tex   = ShaderProgram(Shader(VERT_TEX, 'vertex'),   Shader(FRAG_TEX,   'fragment'))
         self._bound_kind = None
         self._bound_texture_id = None
         self._bound_vao = None
+        self._instance_vbo = None
+        self._instance_capacity = 0
 
     def begin_frame(self):
         self._bound_kind = None
         self._bound_texture_id = None
         self._bound_vao = None
 
-    def _build_gpu_color(self, mesh: Mesh):
+    def _color_array(self, mesh: Mesh):
         n = len(mesh.verts)
         inter = []
-        # Detect if verts is flat list or list of tuples
         is_flat = n > 0 and isinstance(mesh.verts[0], (int, float))
-        
+
         if is_flat:
-            # Flat list: iterate in steps of 3
             vertex_count = n // 3
             for i in range(0, n, 3):
                 x = mesh.verts[i]
-                y = mesh.verts[i+1]
-                z = mesh.verts[i+2]
-                r, g, b = mesh.cols[i//3] if mesh.cols else (1.0, 1.0, 1.0)
+                y = mesh.verts[i + 1]
+                z = mesh.verts[i + 2]
+                r, g, b = mesh.cols[i // 3] if mesh.cols else (1.0, 1.0, 1.0)
                 inter.extend((x, y, z, r, g, b))
         else:
-            # List of tuples
             vertex_count = n
             for i in range(n):
                 x, y, z = mesh.verts[i]
                 r, g, b = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
                 inter.extend((x, y, z, r, g, b))
-        
-        arr = (gl.GLfloat * (6 * vertex_count))(*inter)
 
+        arr = (gl.GLfloat * max(1, 6 * vertex_count))(*inter) if vertex_count else None
+        return arr, vertex_count
+
+    def _next_capacity(self, needed: int, current: int = 0) -> int:
+        capacity = max(1, current)
+        while capacity < needed:
+            capacity *= 2
+        return capacity
+
+    def _build_gpu_color(self, mesh: Mesh, usage=None, capacity_vertices: Optional[int] = None):
+        arr, vertex_count = self._color_array(mesh)
+        usage = usage if usage is not None else gl.GL_STATIC_DRAW
+        capacity = max(vertex_count, capacity_vertices or vertex_count)
         vao = gl.GLuint()
         vbo = gl.GLuint()
         gl.glGenVertexArrays(1, ctypes.byref(vao))
         gl.glGenBuffers(1, ctypes.byref(vbo))
         gl.glBindVertexArray(vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, gl.GL_STATIC_DRAW)
+        if capacity > vertex_count:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 6 * capacity * ctypes.sizeof(gl.GLfloat), None, usage)
+            if arr is not None:
+                gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
+        elif arr is not None:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, usage)
+        else:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 0, None, usage)
 
         stride = 6 * ctypes.sizeof(gl.GLfloat)
         gl.glEnableVertexAttribArray(0)
@@ -1969,6 +2097,42 @@ class Renderer:
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
+        mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
+        mesh._gpu_capacity = capacity
+        mesh._gpu_usage = usage
+
+    def update_color_mesh(self, mesh: Mesh, verts, cols, mode=None):
+        mesh.verts = verts
+        mesh.cols = cols
+        mesh.uvs = None
+        mesh.texture_id = None
+        if mode is not None:
+            mesh.mode = mode
+
+        arr, vertex_count = self._color_array(mesh)
+        if vertex_count == 0:
+            if hasattr(mesh, "_gpu"):
+                vao, vbo, _n, _mode, _kind = mesh._gpu
+                mesh._gpu = (vao, vbo, 0, mesh.mode, 'color')
+            return
+
+        if not hasattr(mesh, "_gpu"):
+            capacity = self._next_capacity(vertex_count)
+            self._build_gpu_color(mesh, usage=gl.GL_DYNAMIC_DRAW, capacity_vertices=capacity)
+            return
+
+        vao, vbo, _n, _mode, kind = mesh._gpu
+        if kind != 'color':
+            self._build_gpu_color(mesh, usage=gl.GL_DYNAMIC_DRAW, capacity_vertices=self._next_capacity(vertex_count))
+            return
+
+        capacity = getattr(mesh, "_gpu_capacity", 0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        if vertex_count > capacity:
+            capacity = self._next_capacity(vertex_count, capacity)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 6 * capacity * ctypes.sizeof(gl.GLfloat), None, gl.GL_DYNAMIC_DRAW)
+            mesh._gpu_capacity = capacity
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
 
     def _build_gpu_tex(self, mesh: Mesh):
@@ -2034,8 +2198,37 @@ class Renderer:
         gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'tex')
+        mesh._gpu_capacity = vertex_count
+        mesh._gpu_usage = gl.GL_STATIC_DRAW
+
+    def _ensure_instance_buffer(self, count: int):
+        if count <= self._instance_capacity and self._instance_vbo is not None:
+            return
+        self._instance_capacity = self._next_capacity(count, self._instance_capacity)
+        if self._instance_vbo is None:
+            self._instance_vbo = gl.GLuint()
+            gl.glGenBuffers(1, ctypes.byref(self._instance_vbo))
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        gl.glBufferData(
+            gl.GL_ARRAY_BUFFER,
+            16 * self._instance_capacity * ctypes.sizeof(gl.GLfloat),
+            None,
+            gl.GL_DYNAMIC_DRAW,
+        )
+
+    def instance_batch_key(self, mesh: Mesh):
+        if mesh.uvs is not None or mesh.texture_id is not None:
+            return None
+        if not hasattr(mesh, "_gpu"):
+            self._build_gpu_color(mesh)
+        vao, _vbo, n, mode, kind = mesh._gpu
+        if kind != 'color' or n <= 0:
+            return None
+        return (vao.value, n, mode)
 
     def draw_mesh(self, mesh: Mesh, proj_view, alpha: float = 1.0):
+        if not mesh.verts:
+            return
         if not hasattr(mesh, "_gpu"):
             if mesh.uvs is not None and mesh.texture_id is not None:
                 self._build_gpu_tex(mesh)
@@ -2043,6 +2236,8 @@ class Renderer:
                 self._build_gpu_color(mesh)
 
         vao, _vbo, n, mode, kind = mesh._gpu
+        if n <= 0:
+            return
         mvp = mat4_mul(proj_view, mesh.model)
 
         if kind == 'tex':
@@ -2067,6 +2262,61 @@ class Renderer:
             gl.glBindVertexArray(vao)
             self._bound_vao = vao.value
         gl.glDrawArrays(mode, 0, n)
+
+    def draw_mesh_instances(self, mesh: Mesh, proj_view, models, alpha: float = 1.0):
+        if not models:
+            return
+        if len(models) == 1 or not hasattr(gl, "glDrawArraysInstanced"):
+            original_model = mesh.model
+            for model in models:
+                mesh.model = model
+                self.draw_mesh(mesh, proj_view, alpha=alpha)
+            mesh.model = original_model
+            return
+
+        if not hasattr(mesh, "_gpu"):
+            self._build_gpu_color(mesh)
+        vao, _vbo, n, mode, kind = mesh._gpu
+        if kind != 'color' or n <= 0:
+            original_model = mesh.model
+            for model in models:
+                mesh.model = model
+                self.draw_mesh(mesh, proj_view, alpha=alpha)
+            mesh.model = original_model
+            return
+
+        self._ensure_instance_buffer(len(models))
+        flat = []
+        for model in models:
+            flat.extend(model)
+        arr = (gl.GLfloat * len(flat))(*flat)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
+
+        if self._bound_kind != 'color_inst':
+            self.prog_color_inst.use()
+            self._bound_kind = 'color_inst'
+            self._bound_texture_id = None
+        self.prog_color_inst['u_proj_view'] = proj_view
+        self.prog_color_inst['u_alpha'] = alpha
+
+        gl.glBindVertexArray(vao)
+        self._bound_vao = vao.value
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        stride = 16 * ctypes.sizeof(gl.GLfloat)
+        for i in range(4):
+            attrib = 2 + i
+            gl.glEnableVertexAttribArray(attrib)
+            gl.glVertexAttribPointer(
+                attrib,
+                4,
+                gl.GL_FLOAT,
+                gl.GL_FALSE,
+                stride,
+                ctypes.c_void_p(i * 4 * ctypes.sizeof(gl.GLfloat)),
+            )
+            gl.glVertexAttribDivisor(attrib, 1)
+        gl.glDrawArraysInstanced(mode, 0, n, len(models))
 
     def warm_mesh(self, mesh: Mesh):
         if hasattr(mesh, "_gpu"):
@@ -2125,6 +2375,12 @@ class AVHMI(pyglet.window.Window):
             anchor_y="bottom",
             color=(235, 245, 255, 230),
         )
+        self.profiler = FrameProfiler(
+            read_bool_env("WAUTOVANTAGE_PROFILE", False),
+            read_float_env("WAUTOVANTAGE_PROFILE_INTERVAL", 2.0, minimum=0.25),
+        )
+        geometry_hz = read_float_env("WAUTOVANTAGE_PERCEPTION_GEOMETRY_MAX_HZ", 20.0, minimum=1.0)
+        self._perception_geometry_min_interval = 1.0 / geometry_hz
         self.camera_origin_local = (0.0, 1.35, 0.0)
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
@@ -2136,12 +2392,20 @@ class AVHMI(pyglet.window.Window):
         self._ego_speed_mph_history = []
         self.perception_bridge = ROSPerceptionBridge()
         self._last_lane_stamp = 0.0
+        self._pending_lane_stamp = 0.0
+        self._pending_lanes: List[Dict[str, object]] = []
+        self._last_lane_geometry_sync_time = 0.0
         self.lane_meshes: List[Mesh] = []
+        self._lane_dynamic_meshes: Dict[Tuple[float, float, float], Mesh] = {}
         self.stopbar_mesh: Optional[Mesh] = None
         self.stopbar_distance: Optional[float] = None
         self._last_stopbar_stamp = 0.0
         self.driveable_polygon_mesh: Optional[Mesh] = None
         self._last_driveable_polygon_stamp = 0.0
+        self._pending_driveable_polygon_stamp = 0.0
+        self._pending_driveable_polygon: List[Tuple[float, float, float]] = []
+        self._last_driveable_polygon_geometry_sync_time = 0.0
+        self._driveable_polygon_visible = False
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -2149,6 +2413,7 @@ class AVHMI(pyglet.window.Window):
         self._projection_matrix = perspective(60.0, max(1e-6, width / float(height)), 0.1, 500.0)
         self._projection_dirty = False
         self.detected_car_color = (0.55, 0.57, 0.60)
+        self.brake_on = False
 
         self.ego = Ego()
         car_obj_path = asset_path("WAutoCar.obj")
@@ -2501,9 +2766,10 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"WARNING: failed to build street signs: {e}")
 
-        gv, gc = make_grid_tile(self.tile_size, self.tile_step)
-        self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity()) 
+        self.grid_tile_verts, self.grid_tile_cols = make_grid_tile(self.tile_size, self.tile_step)
+        self.grid_mesh = Mesh([], [], None, None, gl.GL_LINES, mat4_identity())
         self.grid_tiles = {}
+        self._grid_center_tile = None
         self.lane_meshes = [Mesh(*make_polyline(pts), None, None, gl.GL_LINES, mat4_identity()) for pts in lane_pts]
 
         # Camera (initialize behind the car)
@@ -2513,6 +2779,7 @@ class AVHMI(pyglet.window.Window):
         self.cam_height = 2.5
 
         self.renderer = Renderer()
+        self._stream_grid()
         self._warm_detected_templates()
         self.last_time = time.perf_counter()
         self._disable_demo_detection_actors()
@@ -2541,19 +2808,21 @@ class AVHMI(pyglet.window.Window):
         ix = int(math.floor(self.ego.pos[0] / self.tile_size))
         iz = int(math.floor(self.ego.pos[2] / self.tile_size))
 
-        needed = set()
+        center = (ix, iz)
+        if center == self._grid_center_tile:
+            return
+
+        verts = []
+        cols = []
         for i in range(ix - self.tile_radius, ix + self.tile_radius + 1):
             for j in range(iz - self.tile_radius, iz + self.tile_radius + 1):
-                needed.add((i, j))
-                if (i, j) not in self.grid_tiles:
-                    mx = i * self.tile_size
-                    mz = j * self.tile_size
-                    self.grid_tiles[(i, j)] = mat4_translate(mx, 0.0, mz)
+                mx = i * self.tile_size
+                mz = j * self.tile_size
+                verts.extend(translate_mesh(self.grid_tile_verts, mx, 0.0, mz))
+                cols.extend(self.grid_tile_cols)
 
-        # Drop tiles that are far behind
-        to_delete = [key for key in self.grid_tiles.keys() if key not in needed]
-        for key in to_delete:
-            del self.grid_tiles[key]
+        self.renderer.update_color_mesh(self.grid_mesh, verts, cols, gl.GL_LINES)
+        self._grid_center_tile = center
 
     def _disable_demo_detection_actors(self):
         self.show_obstacles = False
@@ -2718,7 +2987,7 @@ class AVHMI(pyglet.window.Window):
             entity.snap_to_lane_yaw(self._nearest_lane_snap_yaw(pose, entity))
 
     def _sync_lane_lines(self, lanes: List[Dict[str, object]]):
-        meshes = []
+        lane_groups: Dict[Tuple[float, float, float], Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]] = {}
         segments = []
         rendered_lane_count = 0
 
@@ -2734,12 +3003,15 @@ class AVHMI(pyglet.window.Window):
                 continue
 
             render_points = smooth_polyline(lane_points, passes=LANE_LINE_SMOOTHING_PASSES)
+            color = self._lane_color_for_type(line_type)
             verts, cols = make_polyline_ribbon(
                 render_points,
                 width=LANE_LINE_WIDTH_M,
-                color=self._lane_color_for_type(line_type),
+                color=color,
             )
-            meshes.append(Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity()))
+            group_verts, group_cols = lane_groups.setdefault(color, ([], []))
+            group_verts.extend(verts)
+            group_cols.extend(cols)
             orientation_points = resample_polyline_for_orientation(render_points, LANE_ORIENTATION_MIN_SEGMENT_M)
             for idx in range(len(orientation_points) - 1):
                 start = orientation_points[idx]
@@ -2757,9 +3029,15 @@ class AVHMI(pyglet.window.Window):
                 })
             rendered_lane_count += 1
 
-        self.lane_meshes = meshes
-        for mesh in self.lane_meshes:
-            self.renderer.warm_mesh(mesh)
+        active_meshes = []
+        for color, (verts, cols) in lane_groups.items():
+            mesh = self._lane_dynamic_meshes.get(color)
+            if mesh is None:
+                mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+                self._lane_dynamic_meshes[color] = mesh
+            self.renderer.update_color_mesh(mesh, verts, cols, gl.GL_TRIANGLES)
+            active_meshes.append(mesh)
+        self.lane_meshes = active_meshes
         self._lane_orientation_segments = segments
         cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         for segment in segments:
@@ -2774,19 +3052,16 @@ class AVHMI(pyglet.window.Window):
 
     def _sync_stopbar(self, depth: Optional[float]):
         if depth is None:
-            self.stopbar_mesh = None
             self.stopbar_distance = None
             return
 
         try:
             distance = float(depth)
         except (TypeError, ValueError):
-            self.stopbar_mesh = None
             self.stopbar_distance = None
             return
 
         if not math.isfinite(distance) or distance <= 0.1 or distance >= 9000.0:
-            self.stopbar_mesh = None
             self.stopbar_distance = None
             return
 
@@ -2797,8 +3072,9 @@ class AVHMI(pyglet.window.Window):
             STOPBAR_RENDER_LIFT_M,
             color=(1.0, 1.0, 1.0),
         )
-        self.stopbar_mesh = Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
-        self.renderer.warm_mesh(self.stopbar_mesh)
+        if self.stopbar_mesh is None:
+            self.stopbar_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.stopbar_mesh, verts, cols, gl.GL_TRIANGLES)
         self.stopbar_distance = distance
 
     def _sync_driveable_polygon(self, points: List[Tuple[float, float, float]]):
@@ -2816,11 +3092,13 @@ class AVHMI(pyglet.window.Window):
 
         verts, cols = triangulate_polygon(local_points, color=(0.46, 0.46, 0.46))
         if not verts:
-            self.driveable_polygon_mesh = None
+            self._driveable_polygon_visible = False
             return
 
-        self.driveable_polygon_mesh = Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
-        self.renderer.warm_mesh(self.driveable_polygon_mesh)
+        if self.driveable_polygon_mesh is None:
+            self.driveable_polygon_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.driveable_polygon_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._driveable_polygon_visible = True
 
     def _make_mesh_actor(self, mesh: Mesh):
         return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
@@ -2841,6 +3119,42 @@ class AVHMI(pyglet.window.Window):
             return
         if hasattr(actor, "mesh"):
             self.renderer.warm_mesh(actor.mesh)
+
+    def _queue_instanced_mesh(self, mesh: Mesh, instance_groups) -> bool:
+        key = self.renderer.instance_batch_key(mesh)
+        if key is None:
+            return False
+        template_mesh, models = instance_groups.setdefault(key, (mesh, []))
+        models.append(list(mesh.model))
+        return True
+
+    def _draw_detected_entities(self, pv, car_M):
+        instance_groups = {}
+
+        for entity in self.detected_entities.values():
+            entity.apply_anchor(car_M)
+            actor = entity.actor
+            if actor is None:
+                continue
+
+            if isinstance(actor, StreetSign):
+                self.renderer.draw_mesh(actor.pole_mesh, pv)
+                for mesh in actor.panel_meshes:
+                    self.renderer.draw_mesh(mesh, pv)
+                continue
+
+            if isinstance(actor, TrafficLight):
+                self.renderer.draw_mesh(actor.mesh, pv)
+                continue
+
+            mesh = actor if isinstance(actor, Mesh) else getattr(actor, "mesh", None)
+            if mesh is None:
+                continue
+            if not self._queue_instanced_mesh(mesh, instance_groups):
+                self.renderer.draw_mesh(mesh, pv)
+
+        for _key, (mesh, models) in instance_groups.items():
+            self.renderer.draw_mesh_instances(mesh, pv, models)
 
     def _actor_key_for_detection(self, detection: Dict[str, float]):
         obj_class = int(detection["obj_class"])
@@ -3130,65 +3444,85 @@ class AVHMI(pyglet.window.Window):
         self.last_time = now
         self._update_frame_index += 1
 
-        self.perception_bridge.spin_once()
-        detection_stamp, detections = self.perception_bridge.latest_object_snapshot()
+        with self.profiler.section("ros_ingest"):
+            detection_stamp, detections = self.perception_bridge.latest_object_snapshot()
+            lane_stamp, lanes = self.perception_bridge.latest_lane_snapshot()
+            stopbar_stamp, stopbar_depth = self.perception_bridge.latest_stopbar_snapshot()
+            polygon_stamp, driveable_polygon = self.perception_bridge.latest_driveable_polygon_snapshot()
+
         if detection_stamp > self._last_detection_stamp:
-            self._sync_detected_entities(detections)
+            with self.profiler.section("sync_objects"):
+                self._sync_detected_entities(detections)
             self._last_detection_stamp = detection_stamp
 
-        lane_stamp, lanes = self.perception_bridge.latest_lane_snapshot()
-        if lane_stamp > self._last_lane_stamp:
-            self._sync_lane_lines(lanes)
-            self._last_lane_stamp = lane_stamp
+        if lane_stamp > self._pending_lane_stamp:
+            self._pending_lane_stamp = lane_stamp
+            self._pending_lanes = lanes
+        if (
+            self._pending_lane_stamp > self._last_lane_stamp
+            and now - self._last_lane_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_lanes"):
+                self._sync_lane_lines(self._pending_lanes)
+            self._last_lane_stamp = self._pending_lane_stamp
+            self._last_lane_geometry_sync_time = now
 
-        stopbar_stamp, stopbar_depth = self.perception_bridge.latest_stopbar_snapshot()
         if stopbar_stamp > self._last_stopbar_stamp:
-            self._sync_stopbar(stopbar_depth)
+            with self.profiler.section("mesh_stopbar"):
+                self._sync_stopbar(stopbar_depth)
             self._last_stopbar_stamp = stopbar_stamp
 
         if self.stopbar_mesh is not None and self._last_stopbar_stamp > 0.0:
             if time.perf_counter() - self._last_stopbar_stamp > STOPBAR_FRESHNESS_SEC:
-                self.stopbar_mesh = None
                 self.stopbar_distance = None
 
-        polygon_stamp, driveable_polygon = self.perception_bridge.latest_driveable_polygon_snapshot()
-        if polygon_stamp > self._last_driveable_polygon_stamp:
-            self._sync_driveable_polygon(driveable_polygon)
-            self._last_driveable_polygon_stamp = polygon_stamp
+        if polygon_stamp > self._pending_driveable_polygon_stamp:
+            self._pending_driveable_polygon_stamp = polygon_stamp
+            self._pending_driveable_polygon = driveable_polygon
+        if (
+            self._pending_driveable_polygon_stamp > self._last_driveable_polygon_stamp
+            and now - self._last_driveable_polygon_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_polygon"):
+                self._sync_driveable_polygon(self._pending_driveable_polygon)
+            self._last_driveable_polygon_stamp = self._pending_driveable_polygon_stamp
+            self._last_driveable_polygon_geometry_sync_time = now
 
         if self.driveable_polygon_mesh is not None and self._last_driveable_polygon_stamp > 0.0:
             if time.perf_counter() - self._last_driveable_polygon_stamp > DRIVEABLE_POLYGON_FRESHNESS_SEC:
-                self.driveable_polygon_mesh = None
+                self._driveable_polygon_visible = False
 
-        throttle  = 1.0 if self.keys[key.W] else 0.0
-        brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
-        steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
-        self.brake_on = brake > 0.1
+        with self.profiler.section("simulation"):
+            throttle  = 1.0 if self.keys[key.W] else 0.0
+            brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
+            steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
+            self.brake_on = brake > 0.1
 
-        self.ego.update(dt, throttle, steer_cmd, brake)
-        ground_speed_mps = self._current_ground_speed_mps()
-        for w in self.wheels:
-            r = max(1e-6, w['radius'])
-            self._wheel_roll += (ground_speed_mps / r) * dt
-        self._stream_grid()
+            self.ego.update(dt, throttle, steer_cmd, brake)
+            ground_speed_mps = self._current_ground_speed_mps()
+            for w in self.wheels:
+                r = max(1e-6, w['radius'])
+                self._wheel_roll += (ground_speed_mps / r) * dt
+            self._stream_grid()
 
-        if getattr(self, 'show_obstacles', False):
-            for o in self.obstacles:
-                o.update(dt)
-        # update characters
-        for ch in self.characters:
-            ch.update(dt)
-        # update street signs
-        for ss in self.street_signs:
-            ss.update(dt)
-        # update traffic light
-        if self.traffic_light is not None:
-            self.traffic_light.update(dt)
+            if getattr(self, 'show_obstacles', False):
+                for o in self.obstacles:
+                    o.update(dt)
+            # update characters
+            for ch in self.characters:
+                ch.update(dt)
+            # update street signs
+            for ss in self.street_signs:
+                ss.update(dt)
+            # update traffic light
+            if self.traffic_light is not None:
+                self.traffic_light.update(dt)
 
 
 
     # Draw
     def on_draw(self):
+        draw_start = time.perf_counter()
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         self.renderer.begin_frame()
 
@@ -3213,17 +3547,15 @@ class AVHMI(pyglet.window.Window):
         view = look_at((cx, cy, cz), (tx, ty, tz), (0.0, 1.0, 0.0))
         pv = mat4_mul(proj, view)
 
-        # Draw world with streaming grid
-        for _key, model in self.grid_tiles.items():
-            self.grid_base.model = model
-            self.renderer.draw_mesh(self.grid_base, pv)
+        # Draw world with one batched streaming-grid mesh
+        self.renderer.draw_mesh(self.grid_mesh, pv)
 
         # Car model matrix once
         car_T = mat4_translate(*self.ego.pos)
         car_R = mat4_rotate_y(self.ego.yaw)
         car_M = mat4_mul(car_T, car_R)
 
-        if self.driveable_polygon_mesh is not None:
+        if self.driveable_polygon_mesh is not None and self._driveable_polygon_visible:
             self.driveable_polygon_mesh.model = car_M
             self._draw_translucent_mesh(self.driveable_polygon_mesh, pv, alpha=0.34)
 
@@ -3231,7 +3563,7 @@ class AVHMI(pyglet.window.Window):
             ln.model = car_M
             self.renderer.draw_mesh(ln, pv)
 
-        if self.stopbar_mesh is not None:
+        if self.stopbar_mesh is not None and self.stopbar_distance is not None:
             self.stopbar_mesh.model = car_M
             self.renderer.draw_mesh(self.stopbar_mesh, pv)
 
@@ -3279,26 +3611,29 @@ class AVHMI(pyglet.window.Window):
         for ch in self.characters:
             self.renderer.draw_mesh(ch.mesh, pv)
 
-        for entity in self.detected_entities.values():
-            entity.apply_anchor(car_M)
-            entity.draw(self.renderer, pv)
+        self._draw_detected_entities(pv, car_M)
 
-        self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
+        with self.profiler.section("labels"):
+            self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
 
-        ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
-        stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
-        self.hud.text = (
-            f"Sim Speed {self.ego.v:4.1f} m/s   "
-            f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
-            f"{ros_status}   "
-            f"Objects {len(self.detected_entities)}   "
-            f"Lanes {self._latest_lane_count}   "
-            f"{stopbar_status}"
-        )
-        self.hud.draw()
+            ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
+            stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
+            self.hud.text = (
+                f"Sim Speed {self.ego.v:4.1f} m/s   "
+                f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
+                f"{ros_status}   "
+                f"Objects {len(self.detected_entities)}   "
+                f"Lanes {self._latest_lane_count}   "
+                f"{stopbar_status}"
+            )
+            self.hud.draw()
         
         if hasattr(self, 'streaming'):
-            self.streaming.push_frame()
+            with self.profiler.section("streaming"):
+                self.streaming.push_frame()
+
+        self.profiler.add("draw", time.perf_counter() - draw_start)
+        self.profiler.frame()
 
     def on_close(self):
         self.perception_bridge.close()

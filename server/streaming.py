@@ -326,6 +326,9 @@ a=framesize:96 {self.width}-{self.height}
                     self._last_push = current_time
                 except queue.Empty:
                     pass
+
+    def can_accept_frame(self) -> bool:
+        return self.is_active and not self.frame_queue.full()
     
     def stop(self):
         self.is_active = False
