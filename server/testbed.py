@@ -28,7 +28,7 @@ DETECTION_LATERAL_OFFSET_M = -1.0
 DETECTION_YAW_CORRECTION_RAD = math.radians(DETECTION_YAW_CORRECTION_DEG)
 LANE_CONSENSUS_CLASSES = {1, 11, 13}
 VEHICLE_AXIS_MIN_STEP_M = 0.12
-STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10}
+STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10, 18, 19}
 MOTION_HEADING_CLASSES = {1, 2, 11, 13, 16}
 HEADING_SMOOTH_ALPHA = 0.3
 HEADING_CONFIRM_FRAMES = 5
@@ -234,6 +234,14 @@ def mat4_mul(a, b):  # a @ b, column-major
                             a[3*4 + r]*b[c*4 + 3])
     return out
 
+def mat4_transform_point(m, x: float, y: float, z: float):
+    return (
+        m[0] * x + m[4] * y + m[8]  * z + m[12],
+        m[1] * x + m[5] * y + m[9]  * z + m[13],
+        m[2] * x + m[6] * y + m[10] * z + m[14],
+        m[3] * x + m[7] * y + m[11] * z + m[15],
+    )
+
 def mat4_translate(x, y, z):
     m = mat4_identity()
     m[12], m[13], m[14] = x, y, z
@@ -371,6 +379,38 @@ def make_box_triangles(lx, ly, lz, color=(0.1, 0.8, 0.3)):
     ]
     cols = [color]*len(faces)
     return faces, cols
+
+
+def translate_mesh(verts, dx: float, dy: float, dz: float):
+    return [(x + dx, y + dy, z + dz) for x, y, z in verts]
+
+
+def make_circular_lens(radius: float, depth: float, color=(0.9, 0.1, 0.1), segments: int = 24):
+    """Create a shallow circular lens facing +Z."""
+    front_z = depth * 0.5
+    back_z = -depth * 0.5
+    verts = []
+    cols = []
+    ring_front = []
+    ring_back = []
+    for i in range(segments):
+        ang = (2.0 * math.pi * i) / float(segments)
+        x = radius * math.cos(ang)
+        y = radius * math.sin(ang)
+        ring_front.append((x, y, front_z))
+        ring_back.append((x, y, back_z))
+
+    front_center = (0.0, 0.0, front_z)
+    back_center = (0.0, 0.0, back_z)
+    for i in range(segments):
+        j = (i + 1) % segments
+        verts.extend([front_center, ring_front[i], ring_front[j]])
+        cols.extend([color, color, color])
+        verts.extend([back_center, ring_back[j], ring_back[i]])
+        cols.extend([color, color, color])
+        verts.extend([ring_front[i], ring_back[i], ring_back[j], ring_front[i], ring_back[j], ring_front[j]])
+        cols.extend([color] * 6)
+    return verts, cols
 
 def make_polyline(points, color=(1.0, 1.0, 0.2)):
     verts, cols = [], []
@@ -1085,27 +1125,71 @@ class MovingBox:
 
 class Barricade:
     def __init__(self, x, y, z):
-        # Orange color
-        color = (1.0, 0.5, 0.0)
-        # Dimensions for a barricade (approx 0.8m wide, 1.0m high, 0.2m deep)
-        lx, ly, lz = 0.8, 1.0, 0.2
-        v, c = make_box_triangles(lx, ly, lz, color)
+        v, c = make_three_bar_barricade()
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
         self.pos = [x, y, z]
 
 
+def make_three_bar_barricade():
+    verts = []
+    cols = []
+
+    orange = (1.0, 0.38, 0.02)
+    post_gray = (0.16, 0.16, 0.16)
+    foot_gray = (0.12, 0.12, 0.12)
+
+    bar_width = 1.8
+    bar_height = 0.14
+    bar_depth = 0.12
+    for center_y in (0.32, 0.62, 0.92):
+        bar_verts, bar_cols = make_box_triangles(bar_width, bar_height, bar_depth, orange)
+        verts.extend(translate_mesh(bar_verts, 0.0, center_y - bar_height * 0.5, 0.0))
+        cols.extend(bar_cols)
+
+    for post_x in (-0.72, 0.72):
+        post_verts, post_cols = make_box_triangles(0.08, 1.12, 0.09, post_gray)
+        verts.extend(translate_mesh(post_verts, post_x, 0.0, -0.01))
+        cols.extend(post_cols)
+
+    for foot_x in (-0.55, 0.55):
+        foot_verts, foot_cols = make_box_triangles(0.55, 0.08, 0.42, foot_gray)
+        verts.extend(translate_mesh(foot_verts, foot_x, 0.0, 0.0))
+        cols.extend(foot_cols)
+
+    return verts, cols
+
+
 class MovingBarricade:
-    """Orange work zone barricade (trapezoidal prism) that can move like MovingBox."""
-    def __init__(self, x, y, z,
-                 base_len=1.8, base_depth=0.6,
-                 top_len=1.4, top_depth=0.4,
-                 height=1.0,
-                 color=(1.0, 0.5, 0.0), vel=(0.0, 0.0, 0.0)):
-        v, c = make_trapezoid_prism(base_len, base_depth, top_len, top_depth, height, color)
+    """Road-work barricade with three horizontal orange boards."""
+    def __init__(self, x, y, z, vel=(0.0, 0.0, 0.0)):
+        v, c = make_three_bar_barricade()
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x,y,z), mat4_identity()))
 
         self.vx, self.vy, self.vz = vel
         self.pos = [x, y, z]
+
+    def update(self, dt):
+        self.pos[0] += self.vx*dt
+        self.pos[1] += self.vy*dt
+        self.pos[2] += self.vz*dt
+        self.mesh.model = mat4_translate(*self.pos)
+
+
+class Barrier:
+    """Concrete-style barrier using the old barricade shape."""
+    def __init__(self, x=0.0, y=0.0, z=0.0, vel=(0.0, 0.0, 0.0)):
+        v, c = make_trapezoid_prism(
+            base_len=1.8,
+            base_depth=0.6,
+            top_len=1.4,
+            top_depth=0.4,
+            height=1.0,
+            color=(0.72, 0.72, 0.68),
+        )
+        self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x, y, z), mat4_identity()))
+        self.vx, self.vy, self.vz = vel
+        self.pos = [x, y, z]
+
     def update(self, dt):
         self.pos[0] += self.vx*dt
         self.pos[1] += self.vy*dt
@@ -1138,42 +1222,63 @@ class StaticObject:
 # Traffic Light
 # ------------------------------------------------------------
 class TrafficLight:
-    def __init__(self, x=0.0, y=3.0, z=0.0):
-        # Create light housing
-        box_width = 0.5
-        box_height = 1.35
-        box_depth = 0.25
-        box_verts, box_cols = make_box_triangles(box_width, box_height, box_depth, (0.2, 0.2, 0.2))
-        
-        # Create the three lights
-        light_size = 0.25
-        light_depth = 0.1
-        
-        # Calculate even spacing
-        spacing = (box_height - 3*light_size) / 4
-        
-        # Red light (top)
-        red_y = box_height - spacing - light_size
-        red_verts, red_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.1, 0.1))  # Red
-        red_verts = [(x, y + red_y, z + box_depth/2) for x, y, z in red_verts]
-        
-        # Yellow light (middle)
-        yellow_y = box_height - 2*spacing - 2*light_size
-        yellow_verts, yellow_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.9, 0.1))  # Yellow
-        yellow_verts = [(x, y + yellow_y, z + box_depth/2) for x, y, z in yellow_verts]
-        
-        # Green light (bottom)
-        green_y = box_height - 3*spacing - 3*light_size
-        green_verts, green_cols = make_box_triangles(light_size, light_size, light_depth, (0.1, 0.9, 0.1))  # Green
-        green_verts = [(x, y + green_y, z + box_depth/2) for x, y, z in green_verts]
-        
-        # Combine all vertices and colors
-        all_verts = box_verts + red_verts + yellow_verts + green_verts
-        all_cols = box_cols + red_cols + yellow_cols + green_cols
-        
-        # Create the mesh
-        self.mesh = Mesh(all_verts, all_cols, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+    RED = 1
+    YELLOW = 2
+    GREEN = 3
+
+    def __init__(self, x=0.0, y=3.0, z=0.0, state: int = 255):
         self.pos = [x, y, z]
+        self.state = None
+        self.mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+        self.set_state(state)
+
+    def _build_mesh(self):
+        box_width = 0.32
+        box_height = 0.95
+        box_depth = 0.18
+        box_verts, box_cols = make_box_triangles(box_width, box_height, box_depth, (0.04, 0.04, 0.04))
+
+        active_colors = {
+            self.RED: (1.0, 0.03, 0.02),
+            self.YELLOW: (1.0, 0.82, 0.02),
+            self.GREEN: (0.02, 0.9, 0.12),
+        }
+        dim_colors = {
+            self.RED: (0.12, 0.02, 0.02),
+            self.YELLOW: (0.12, 0.10, 0.02),
+            self.GREEN: (0.02, 0.10, 0.03),
+        }
+
+        all_verts = list(box_verts)
+        all_cols = list(box_cols)
+        lens_radius = 0.095
+        lens_depth = 0.035
+        front_z = (box_depth * 0.5) + (lens_depth * 0.5) + 0.004
+        lens_positions = (
+            (self.RED, 0.73),
+            (self.YELLOW, 0.48),
+            (self.GREEN, 0.23),
+        )
+        for state, center_y in lens_positions:
+            color = active_colors[state] if self.state == state else dim_colors[state]
+            lens_verts, lens_cols = make_circular_lens(lens_radius, lens_depth, color)
+            all_verts.extend(translate_mesh(lens_verts, 0.0, center_y, front_z))
+            all_cols.extend(lens_cols)
+
+        self.mesh.verts = all_verts
+        self.mesh.cols = all_cols
+        if hasattr(self.mesh, "_gpu"):
+            delattr(self.mesh, "_gpu")
+
+    def set_state(self, state: int):
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            state = 255
+        if state == self.state:
+            return
+        self.state = state if state in (self.RED, self.YELLOW, self.GREEN) else 255
+        self._build_mesh()
 
 
     def update(self, dt: float):
@@ -1230,6 +1335,12 @@ class DetectedEntity:
         self.object_id = int(detection["object_id"])
         self.obj_class = int(detection["obj_class"])
         self.custom_classification = int(detection.get("custom_classification", 0))
+        self.reported_coords = (
+            float(detection.get("x", 0.0)),
+            float(detection.get("y", 0.0)),
+            float(detection.get("z", 0.0)),
+        )
+        self.reported_height = float(detection.get("height", 0.0))
         self.actor = actor
         self.actor_key = actor_key
         self.local_pose = [0.0, 0.0, 0.0]
@@ -1253,6 +1364,14 @@ class DetectedEntity:
             self.actor_key = actor_key
         self.obj_class = int(detection["obj_class"])
         self.custom_classification = int(detection.get("custom_classification", 0))
+        self.reported_coords = (
+            float(detection.get("x", 0.0)),
+            float(detection.get("y", 0.0)),
+            float(detection.get("z", 0.0)),
+        )
+        self.reported_height = float(detection.get("height", 0.0))
+        if isinstance(self.actor, TrafficLight):
+            self.actor.set_state(self.custom_classification)
         self.last_seen = time.perf_counter()
 
     def set_local_pose(self, x: float, y: float, z: float, camera_origin_local, ego_motion_local, ego_delta_yaw: float, detection_dt: Optional[float]):
@@ -1435,6 +1554,17 @@ class DetectedEntity:
             return
 
         renderer.draw_mesh(actor.mesh, pv)
+
+    def label_world_point(self, anchor_model, default_height: float):
+        height = self.reported_height
+        if not isinstance(height, (int, float)) or not math.isfinite(height) or height <= 0.01 or height >= 1000.0:
+            height = default_height
+        label_y = self.local_pose[1] + max(0.5, height) + 0.22
+        return mat4_transform_point(anchor_model, self.local_pose[0], label_y, self.local_pose[2])[:3]
+
+    def label_text(self):
+        x, y, z = self.reported_coords
+        return f"{self.object_id}: ({x:.1f}, {y:.1f}, {z:.1f})"
 
 
 # ------------------------------------------------------------
@@ -1637,6 +1767,16 @@ class AVHMI(pyglet.window.Window):
         self.set_exclusive_mouse(False)
         self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
+        self.coord_label = pyglet.text.Label(
+            "",
+            font_name="Roboto",
+            font_size=10,
+            x=0,
+            y=0,
+            anchor_x="center",
+            anchor_y="bottom",
+            color=(235, 245, 255, 230),
+        )
         self.camera_origin_local = (0.0, 1.35, 0.0)
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
@@ -1748,14 +1888,11 @@ class AVHMI(pyglet.window.Window):
         # Rolling state
         self._wheel_roll = 0.0
 
-        # Barricade Model
-        bl, bd = 1.8*0.85, 0.6*0.85
-        tl, td = 1.4*0.85, 0.4*0.85
-        h      = 1.0*0.85
+        # Demo barricade/barrier models. These get disabled when live ROS detections are shown.
         bx, by, bz = 3.0 + 1.2, 0.0, -10.0
-        self.obstacles: List[MovingBarricade] = [
-            MovingBarricade(bx, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(1.0, 0.5, 0.0)),
-            MovingBarricade(bx + 2.0, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(0.6, 0.6, 0.6))
+        self.obstacles: List[object] = [
+            MovingBarricade(bx, by, bz),
+            Barrier(bx + 2.0, by, bz),
         ]
         self.show_obstacles = True
 
@@ -2096,6 +2233,8 @@ class AVHMI(pyglet.window.Window):
             14: 1.5,
             15: 3.5,
             16: 1.8,
+            18: 1.0,
+            19: 1.0,
         }.get(obj_class, 1.0)
 
     def _valid_detection(self, detection: Dict[str, float]) -> bool:
@@ -2331,6 +2470,8 @@ class AVHMI(pyglet.window.Window):
             14: (0.8, 0.2, 0.2),
             15: (0.55, 0.55, 0.55),
             16: (0.8, 0.7, 0.6),
+            18: (0.72, 0.72, 0.68),
+            19: (0.82, 0.58, 0.16),
         }
         v, c = make_box_triangles(width, height, depth, colors.get(obj_class, (0.7, 0.7, 0.7)))
         mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_identity())
@@ -2349,7 +2490,7 @@ class AVHMI(pyglet.window.Window):
         if obj_class == 4:
             return MovingBarricade(0.0, 0.0, 0.0)
         if obj_class == 5:
-            return TrafficLight(0.0, 0.0, 0.0)
+            return TrafficLight(0.0, 0.0, 0.0, state=custom)
         if obj_class == 6:
             sign_kind = "speed"
             if custom == 5:
@@ -2361,6 +2502,8 @@ class AVHMI(pyglet.window.Window):
             return self._make_mesh_actor(self.detected_mesh_templates["barrel"])
         if obj_class == 9 and "cone" in self.detected_mesh_templates:
             return self._make_mesh_actor(self.detected_mesh_templates["cone"])
+        if obj_class == 18:
+            return Barrier(0.0, 0.0, 0.0)
         return self._build_fallback_actor(obj_class, detection)
 
     def _sync_detected_entities(self, detections: List[Dict[str, float]]):
@@ -2516,6 +2659,41 @@ class AVHMI(pyglet.window.Window):
             self._projection_dirty = False
         return self._projection_matrix
 
+    def _project_world_to_screen(self, pv, world_point):
+        clip_x, clip_y, clip_z, clip_w = mat4_transform_point(pv, world_point[0], world_point[1], world_point[2])
+        if clip_w <= 1e-6:
+            return None
+        ndc_x = clip_x / clip_w
+        ndc_y = clip_y / clip_w
+        ndc_z = clip_z / clip_w
+        if ndc_x < -1.15 or ndc_x > 1.15 or ndc_y < -1.15 or ndc_y > 1.15 or ndc_z < -1.0 or ndc_z > 1.0:
+            return None
+        return ((ndc_x * 0.5 + 0.5) * self.width, (ndc_y * 0.5 + 0.5) * self.height)
+
+    def _draw_coordinate_labels(self, pv, car_M, camera_world):
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        for entity in self.detected_entities.values():
+            if not entity._pose_initialized:
+                continue
+            world_point = entity.label_world_point(car_M, self._default_height_for_class(entity.obj_class))
+            screen_point = self._project_world_to_screen(pv, world_point)
+            if screen_point is None:
+                continue
+
+            wx, wy, wz = world_point
+            cx, cy, cz = camera_world
+            camera_distance = math.sqrt((wx - cx) ** 2 + (wy - cy) ** 2 + (wz - cz) ** 2)
+            font_size = int(clamp(15.0 - (camera_distance * 0.16), 5.0, 12.0))
+            alpha = int(clamp(260.0 - (camera_distance * 2.0), 95.0, 235.0))
+
+            self.coord_label.text = entity.label_text()
+            self.coord_label.font_size = font_size
+            self.coord_label.x = screen_point[0]
+            self.coord_label.y = screen_point[1]
+            self.coord_label.color = (235, 245, 255, alpha)
+            self.coord_label.draw()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
     def _current_ground_speed_mps(self):
         if self._last_detection_stamp > 0.0:
             age = time.perf_counter() - self._last_detection_stamp
@@ -2657,6 +2835,8 @@ class AVHMI(pyglet.window.Window):
         for entity in self.detected_entities.values():
             entity.apply_anchor(car_M)
             entity.draw(self.renderer, pv)
+
+        self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
 
         ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
         self.hud.text = (
