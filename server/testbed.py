@@ -11,13 +11,16 @@ from pyglet.graphics.shader import Shader, ShaderProgram
 try:
     import rclpy
     from rclpy.node import Node
-    from wauto_perception_msgs.msg import ObjectArray, LaneArray
+    from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth
+    from geometry_msgs.msg import PolygonStamped
     ROS2_AVAILABLE = True
 except ImportError:
     rclpy = None
     Node = object
     ObjectArray = None
     LaneArray = None
+    StopbarDepth = None
+    PolygonStamped = None
     ROS2_AVAILABLE = False
 
 
@@ -58,6 +61,14 @@ LANE_LINE_CONFIDENCE_MIN = 0.30
 LANE_LINE_RENDER_LIFT_M = 0.04
 LANE_LINE_WIDTH_M = 0.18
 LANE_LINE_SMOOTHING_PASSES = 2
+STOPBAR_RENDER_LIFT_M = 0.035
+STOPBAR_WIDTH_M = 5.0
+STOPBAR_THICKNESS_M = 0.38
+STOPBAR_FRESHNESS_SEC = 0.8
+DRIVEABLE_POLYGON_RENDER_LIFT_M = 0.02
+DRIVEABLE_POLYGON_FRESHNESS_SEC = 0.8
+SIGN_OVERLAY_EGO_FACE_OFFSET_M = -0.036
+SIGN_OVERLAY_LAYER_STEP_M = 0.006
 LANE_ORIENTATION_CLASSES = {1, 11, 13}
 LANE_ORIENTATION_SNAP_DISTANCE_M = 4.5
 LANE_ORIENTATION_MIN_SEGMENT_M = 0.35
@@ -268,6 +279,15 @@ def mat4_rotate_z(theta):
              0, 0,1,0,
              0, 0,0,1]
 
+def transform_vertices(verts, matrix):
+    transformed = []
+    for x, y, z in verts:
+        tx, ty, tz, tw = mat4_transform_point(matrix, x, y, z)
+        if abs(tw) > 1e-9:
+            tx, ty, tz = tx / tw, ty / tw, tz / tw
+        transformed.append((tx, ty, tz))
+    return transformed
+
 def mat4_scale(sx, sy, sz):
     return [sx,0, 0, 0,
             0, sy,0, 0,
@@ -328,9 +348,10 @@ void main(){
 FRAG_COLOR = """
 #version 330
 in vec3 v_col;
+uniform float u_alpha;
 out vec4 out_col;
 void main(){
-    out_col = vec4(v_col, 1.0);
+    out_col = vec4(v_col, u_alpha);
 }
 """
 
@@ -509,6 +530,34 @@ def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
         cols.extend((color, color, color, color, color, color))
     return verts, cols
 
+
+def make_ground_rect(width: float, thickness: float, center_z: float, lift: float, color=(1.0, 1.0, 1.0)):
+    half_width = width * 0.5
+    half_thickness = thickness * 0.5
+    z0 = center_z - half_thickness
+    z1 = center_z + half_thickness
+    verts = [
+        (-half_width, lift, z0),
+        ( half_width, lift, z0),
+        ( half_width, lift, z1),
+        (-half_width, lift, z0),
+        ( half_width, lift, z1),
+        (-half_width, lift, z1),
+    ]
+    return verts, [color] * len(verts)
+
+
+def triangulate_polygon_fan(points, color=(0.46, 0.46, 0.46)):
+    if len(points) < 3:
+        return [], []
+    verts = []
+    cols = []
+    anchor = points[0]
+    for i in range(1, len(points) - 1):
+        verts.extend([anchor, points[i], points[i + 1]])
+        cols.extend([color, color, color])
+    return verts, cols
+
 def make_grid(size=80, step=2.0, color=(0.25, 0.25, 0.25)):
     s = size
     verts, cols = [], []
@@ -642,6 +691,189 @@ def make_rounded_rect_sign(width: float, height: float, thickness: float, color=
         cols.extend([color] * 6)
 
     return verts, cols
+
+
+def transform_sign_verts(verts, sx: float = 1.0, sz: float = 1.0, dx: float = 0.0, dz: float = 0.0):
+    return [((x * sx) + dx, y, (z * sz) + dz) for x, y, z in verts]
+
+
+def append_sign_part(parts, verts, cols, sx: float = 1.0, sz: float = 1.0, dx: float = 0.0, dz: float = 0.0):
+    parts.append((transform_sign_verts(verts, sx=sx, sz=sz, dx=dx, dz=dz), cols))
+
+
+def append_sign_part_matrix(parts, verts, cols, matrix):
+    parts.append((transform_vertices(verts, matrix), cols))
+
+
+def make_sign_bar(width: float, height: float, thickness: float, color, dx: float = 0.0, dz: float = 0.0):
+    verts, cols = make_box_triangles(width, thickness, height, color)
+    return transform_sign_verts(verts, dx=dx, dz=dz), cols
+
+
+def make_sign_ring(outer_radius: float, inner_radius: float, thickness: float, color, segments: int = 32):
+    inner_radius = min(inner_radius, outer_radius - 1e-4)
+    front_y = 0.0
+    back_y = -thickness
+    outer_front = []
+    inner_front = []
+    outer_back = []
+    inner_back = []
+    for i in range(segments):
+        ang = (2.0 * math.pi * i) / float(segments)
+        ca = math.cos(ang)
+        sa = math.sin(ang)
+        outer_front.append((outer_radius * ca, front_y, outer_radius * sa))
+        inner_front.append((inner_radius * ca, front_y, inner_radius * sa))
+        outer_back.append((outer_radius * ca, back_y, outer_radius * sa))
+        inner_back.append((inner_radius * ca, back_y, inner_radius * sa))
+
+    verts = []
+    cols = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        verts.extend([outer_front[i], outer_front[j], inner_front[j], outer_front[i], inner_front[j], inner_front[i]])
+        verts.extend([outer_back[i], inner_back[j], outer_back[j], outer_back[i], inner_back[i], inner_back[j]])
+        verts.extend([outer_front[i], outer_back[i], outer_back[j], outer_front[i], outer_back[j], outer_front[j]])
+        verts.extend([inner_front[i], inner_front[j], inner_back[j], inner_front[i], inner_back[j], inner_back[i]])
+        cols.extend([color] * 24)
+    return verts, cols
+
+
+def make_sign_arrow(direction: str, color=(0.05, 0.05, 0.05), thickness: float = 0.012):
+    sign = -1.0 if direction == "left" else 1.0
+    verts = []
+    cols = []
+    shaft_verts, shaft_cols = make_box_triangles(0.34, thickness, 0.11, color)
+    verts.extend(transform_sign_verts(shaft_verts, dx=-0.04 * sign))
+    cols.extend(shaft_cols)
+
+    head = [
+        (0.0, 0.0, 0.16),
+        (0.18 * sign, 0.0, 0.0),
+        (0.0, 0.0, -0.16),
+        (0.0, -thickness, 0.16),
+        (0.18 * sign, -thickness, 0.0),
+        (0.0, -thickness, -0.16),
+    ]
+    verts.extend([head[0], head[1], head[2], head[3], head[5], head[4]])
+    cols.extend([color] * 6)
+    for a, b, c, d in ((0, 1, 3, 4), (1, 2, 4, 5), (2, 0, 5, 3)):
+        verts.extend([head[a], head[b], head[d], head[a], head[d], head[c]])
+        cols.extend([color] * 6)
+    return verts, cols
+
+
+def make_sign_text_block(text: str, scale: float = 1.0, color=(0.04, 0.04, 0.04), thickness: float = 0.012):
+    digit_patterns = {
+        "2": ("111", "001", "111", "100", "111"),
+        "5": ("111", "100", "111", "001", "111"),
+        "S": ("111", "100", "111", "001", "111"),
+        "T": ("111", "010", "010", "010", "010"),
+        "O": ("111", "101", "101", "101", "111"),
+        "P": ("111", "101", "111", "100", "100"),
+    }
+    cell = 0.045 * scale
+    gap = 0.012 * scale
+    digit_w = 3 * cell
+    digit_h = 5 * cell
+    total_w = (len(text) * digit_w) + (max(0, len(text) - 1) * gap)
+    verts = []
+    cols = []
+    start_x = -total_w * 0.5
+    start_z = digit_h * 0.5
+    for digit_index, char in enumerate(text):
+        pattern = digit_patterns.get(char)
+        if pattern is None:
+            continue
+        base_x = start_x + digit_index * (digit_w + gap)
+        for row, row_bits in enumerate(pattern):
+            for col, bit in enumerate(row_bits):
+                if bit != "1":
+                    continue
+                cx = base_x + (col + 0.5) * cell
+                cz = start_z - (row + 0.5) * cell
+                block_verts, block_cols = make_box_triangles(cell * 0.82, thickness, cell * 0.82, color)
+                verts.extend(transform_sign_verts(block_verts, dx=cx, dz=cz))
+                cols.extend(block_cols)
+    return verts, cols
+
+
+def make_no_turn_overlay(direction: str):
+    parts = []
+    arrow_verts, arrow_cols = make_sign_arrow(direction, color=(0.02, 0.02, 0.02), thickness=0.014)
+    append_sign_part(parts, arrow_verts, arrow_cols)
+    ring_verts, ring_cols = make_sign_ring(0.37, 0.31, 0.012, (0.88, 0.03, 0.03))
+    append_sign_part(parts, ring_verts, ring_cols)
+    slash_verts, slash_cols = make_sign_bar(0.08, 0.82, 0.014, (0.88, 0.03, 0.03))
+    append_sign_part_matrix(parts, slash_verts, slash_cols, mat4_rotate_y(math.radians(38.0)))
+    return parts
+
+
+def make_street_sign_parts(kind: str, thickness: float, scale: float = 1.0):
+    parts = []
+    black = (0.04, 0.04, 0.04)
+    white = (1.0, 1.0, 1.0)
+    red = (0.9, 0.04, 0.04)
+    yellow = (0.95, 0.82, 0.08)
+
+    if kind == "stop":
+        verts, cols = make_regular_polygon(8, 0.46 * scale, thickness, red, angle_offset=math.pi / 8.0)
+        append_sign_part(parts, verts, cols)
+        text_verts, text_cols = make_sign_text_block("STOP", scale=1.35 * scale, color=white, thickness=thickness * 0.7)
+        append_sign_part(parts, text_verts, text_cols)
+        return parts
+
+    if kind == "yield":
+        border_verts, border_cols = make_triangle_sign(0.98 * scale, thickness, red)
+        append_sign_part(parts, border_verts, border_cols)
+        face_verts, face_cols = make_triangle_sign(0.74 * scale, thickness * 0.7, white)
+        append_sign_part(parts, face_verts, face_cols)
+        return parts
+
+    if kind == "do_not_enter":
+        circle_verts, circle_cols = make_regular_polygon(32, 0.42 * scale, thickness, red)
+        append_sign_part(parts, circle_verts, circle_cols)
+        bar_verts, bar_cols = make_sign_bar(0.62 * scale, 0.12 * scale, thickness * 0.8, white)
+        append_sign_part(parts, bar_verts, bar_cols)
+        return parts
+
+    if kind == "pedestrian":
+        diamond_verts, diamond_cols = make_regular_polygon(4, 0.48 * scale, thickness, yellow, angle_offset=0.0)
+        append_sign_part(parts, diamond_verts, diamond_cols)
+        head_verts, head_cols = make_regular_polygon(16, 0.055 * scale, thickness * 0.7, black)
+        append_sign_part(parts, head_verts, head_cols, dx=0.0, dz=0.16 * scale)
+        body_verts, body_cols = make_sign_bar(0.08 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part(parts, body_verts, body_cols, dz=-0.02 * scale)
+        leg_l_verts, leg_l_cols = make_sign_bar(0.055 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part_matrix(parts, transform_sign_verts(leg_l_verts, dx=-0.06 * scale, dz=-0.18 * scale), leg_l_cols, mat4_rotate_y(math.radians(-28.0)))
+        leg_r_verts, leg_r_cols = make_sign_bar(0.055 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part_matrix(parts, transform_sign_verts(leg_r_verts, dx=0.06 * scale, dz=-0.18 * scale), leg_r_cols, mat4_rotate_y(math.radians(28.0)))
+        return parts
+
+    if kind == "railroad":
+        bar1_verts, bar1_cols = make_sign_bar(0.11 * scale, 0.98 * scale, thickness, white)
+        append_sign_part_matrix(parts, bar1_verts, bar1_cols, mat4_rotate_y(math.radians(45.0)))
+        bar2_verts, bar2_cols = make_sign_bar(0.11 * scale, 0.98 * scale, thickness, white)
+        append_sign_part_matrix(parts, bar2_verts, bar2_cols, mat4_rotate_y(math.radians(-45.0)))
+        return parts
+
+    if kind == "one_way":
+        bg_verts, bg_cols = make_rounded_rect_sign(0.9 * scale, 0.42 * scale, thickness, black, radius=0.04 * scale)
+        append_sign_part(parts, bg_verts, bg_cols)
+        arrow_verts, arrow_cols = make_sign_arrow("right", color=white, thickness=thickness * 0.75)
+        append_sign_part(parts, arrow_verts, arrow_cols, sx=1.25 * scale, sz=1.0 * scale)
+        return parts
+
+    bg_verts, bg_cols = make_rounded_rect_sign(0.78 * scale, 0.92 * scale, thickness, white, radius=0.12 * scale)
+    append_sign_part(parts, bg_verts, bg_cols)
+    if kind == "speed":
+        text_verts, text_cols = make_sign_text_block("25", scale=2.0 * scale, color=black, thickness=thickness * 0.7)
+        append_sign_part(parts, text_verts, text_cols)
+    elif kind == "no_right":
+        parts.extend(make_no_turn_overlay("right"))
+    elif kind == "no_left":
+        parts.extend(make_no_turn_overlay("left"))
+    return parts
 
 # ------------------------------------------------------------
 # Barricade builder: trapezoidal prism
@@ -864,10 +1096,22 @@ class LaneLineSubscriber(Node):
 
 
 class PerceptionSubscriber(Node):
-    def __init__(self, on_objects, on_lanes, object_topic="/perception/objectdetection", lane_topic="/perception/lane_lines"):
+    def __init__(
+        self,
+        on_objects,
+        on_lanes,
+        on_stopbar,
+        on_driveable_polygon,
+        object_topic="/perception/objectdetection",
+        lane_topic="/perception/lane_lines",
+        stopbar_topic="/perception/stopbar",
+        driveable_polygon_topic="/perception/driveable_polygon",
+    ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
         self._on_lanes = on_lanes
+        self._on_stopbar = on_stopbar
+        self._on_driveable_polygon = on_driveable_polygon
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -878,6 +1122,18 @@ class PerceptionSubscriber(Node):
             LaneArray,
             lane_topic,
             self._lane_callback,
+            10,
+        )
+        self.stopbar_subscription = self.create_subscription(
+            StopbarDepth,
+            stopbar_topic,
+            self._stopbar_callback,
+            10,
+        )
+        self.driveable_polygon_subscription = self.create_subscription(
+            PolygonStamped,
+            driveable_polygon_topic,
+            self._driveable_polygon_callback,
             10,
         )
 
@@ -908,6 +1164,15 @@ class PerceptionSubscriber(Node):
                 "points": lane_points,
             })
         self._on_lanes(lanes)
+
+    def _stopbar_callback(self, msg):
+        self._on_stopbar(float(msg.depth))
+
+    def _driveable_polygon_callback(self, msg):
+        points = []
+        for point in msg.polygon.points:
+            points.append((float(point.x), float(point.y), float(point.z)))
+        self._on_driveable_polygon(points)
 
 
 class ROSObjectDetectionBridge:
@@ -1010,13 +1275,23 @@ class ROSLaneLineBridge:
 
 
 class ROSPerceptionBridge:
-    def __init__(self, object_topic="/perception/objectdetection", lane_topic="/perception/lane_lines"):
+    def __init__(
+        self,
+        object_topic="/perception/objectdetection",
+        lane_topic="/perception/lane_lines",
+        stopbar_topic="/perception/stopbar",
+        driveable_polygon_topic="/perception/driveable_polygon",
+    ):
         self.enabled = False
         self.node = None
         self._latest_object_stamp = 0.0
         self._latest_lane_stamp = 0.0
+        self._latest_stopbar_stamp = 0.0
+        self._latest_driveable_polygon_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
+        self._latest_stopbar_depth: Optional[float] = None
+        self._latest_driveable_polygon: List[Tuple[float, float, float]] = []
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1028,11 +1303,15 @@ class ROSPerceptionBridge:
             self.node = PerceptionSubscriber(
                 self._store_objects,
                 self._store_lanes,
+                self._store_stopbar,
+                self._store_driveable_polygon,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
+                stopbar_topic=stopbar_topic,
+                driveable_polygon_topic=driveable_polygon_topic,
             )
             self.enabled = True
-            print(f"Subscribed to ROS2 topics '{object_topic}' and '{lane_topic}'")
+            print(f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', '{stopbar_topic}', and '{driveable_polygon_topic}'")
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
             self.enabled = False
@@ -1044,6 +1323,14 @@ class ROSPerceptionBridge:
     def _store_lanes(self, lanes):
         self._latest_lanes = lanes
         self._latest_lane_stamp = time.perf_counter()
+
+    def _store_stopbar(self, depth):
+        self._latest_stopbar_depth = depth
+        self._latest_stopbar_stamp = time.perf_counter()
+
+    def _store_driveable_polygon(self, points):
+        self._latest_driveable_polygon = points
+        self._latest_driveable_polygon_stamp = time.perf_counter()
 
     def spin_once(self):
         if not self.enabled or self.node is None:
@@ -1059,6 +1346,12 @@ class ROSPerceptionBridge:
 
     def latest_lane_snapshot(self):
         return self._latest_lane_stamp, list(self._latest_lanes)
+
+    def latest_stopbar_snapshot(self):
+        return self._latest_stopbar_stamp, self._latest_stopbar_depth
+
+    def latest_driveable_polygon_snapshot(self):
+        return self._latest_driveable_polygon_stamp, list(self._latest_driveable_polygon)
 
     def close(self):
         if self.node is not None:
@@ -1300,38 +1593,34 @@ class StreetSign:
         self.y_adjust = y_adjust
         self.scale = scale
         thickness = 0.02
-        width, height = 0.78, 0.92
-        border_inset = 0.06
-        corner_radius = 0.12
-
-        border_verts, border_cols = make_rounded_rect_sign(
-            width,
-            height,
-            thickness,
-            color=(0.05, 0.05, 0.05),
-            radius=corner_radius,
-        )
-        face_verts, face_cols = make_rounded_rect_sign(
-            width - (border_inset * 2.0),
-            height - (border_inset * 2.0),
-            thickness * 0.7,
-            color=(0.9, 0.08, 0.08) if kind == "stop" else (1.0, 1.0, 1.0),
-            radius=max(0.04, corner_radius - border_inset * 0.65),
-        )
-        self.pole_mesh = Mesh(border_verts, border_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.support_offset_z = 0.085 * scale
         self.panel_offset = (0.0, 1.55 + self.y_adjust, 0.0)
-        self.panel_mesh = Mesh(face_verts, face_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        sign_parts = make_street_sign_parts(kind, thickness, scale=scale)
+        self.panel_meshes = [
+            Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+            for verts, cols in sign_parts
+        ]
+        for index, mesh in enumerate(self.panel_meshes):
+            mesh.layer_offset = 0.0 if index == 0 else SIGN_OVERLAY_EGO_FACE_OFFSET_M - ((index - 1) * SIGN_OVERLAY_LAYER_STEP_M)
+        self.panel_mesh = self.panel_meshes[0] if self.panel_meshes else None
+        sign_bottom = min((z for verts, _cols in sign_parts for _x, _y, z in verts), default=-0.45 * scale)
+        self.pole_height = max(0.15, self.panel_offset[1] + sign_bottom - (0.035 * scale))
+        pole_verts, pole_cols = make_box_triangles(0.08 * scale, self.pole_height, 0.08 * scale, (0.18, 0.18, 0.18))
+        self.pole_mesh = Mesh(pole_verts, pole_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
 
 
     def update(self, dt: float):
         ox, oy, oz = self.panel_offset
-        M = mat4_mul(mat4_translate(*self.pos), mat4_translate(ox, oy, oz))
+        base_M = mat4_translate(*self.pos)
+        pole_M = mat4_mul(base_M, mat4_translate(0.0, 0.0, self.support_offset_z))
+        self.pole_mesh.model = pole_M
+
+        M = mat4_mul(base_M, mat4_translate(ox, oy, oz))
         M = mat4_mul(M, mat4_rotate_x(math.radians(90.0)))
         if getattr(self, 'yaw', 0.0) != 0.0:
             M = mat4_mul(M, mat4_rotate_y(self.yaw))
-        self.pole_mesh.model = M
-        inner = mat4_mul(M, mat4_translate(0.0, 0.011, 0.0))
-        self.panel_mesh.model = inner
+        for mesh in self.panel_meshes:
+            mesh.model = mat4_mul(M, mat4_translate(0.0, mesh.layer_offset, 0.0))
 
 
 class DetectedEntity:
@@ -1489,13 +1778,14 @@ class DetectedEntity:
 
         if isinstance(actor, StreetSign):
             world_model = mat4_mul(anchor_model, local_model)
-            actor.pole_mesh.model = world_model
+            actor.pole_mesh.model = mat4_mul(world_model, mat4_translate(0.0, 0.0, actor.support_offset_z))
             ox, oy, oz = actor.panel_offset
             panel_model = mat4_mul(world_model, mat4_translate(ox, oy, oz))
             panel_model = mat4_mul(panel_model, mat4_rotate_x(math.radians(90.0)))
             if getattr(actor, "yaw", 0.0) != 0.0:
                 panel_model = mat4_mul(panel_model, mat4_rotate_y(actor.yaw))
-            actor.panel_mesh.model = panel_model
+            for mesh in actor.panel_meshes:
+                mesh.model = mat4_mul(panel_model, mat4_translate(0.0, mesh.layer_offset, 0.0))
             return
 
         if isinstance(actor, TrafficLight):
@@ -1546,7 +1836,8 @@ class DetectedEntity:
 
         if isinstance(actor, StreetSign):
             renderer.draw_mesh(actor.pole_mesh, pv)
-            renderer.draw_mesh(actor.panel_mesh, pv)
+            for mesh in actor.panel_meshes:
+                renderer.draw_mesh(mesh, pv)
             return
 
         if isinstance(actor, TrafficLight):
@@ -1692,7 +1983,7 @@ class Renderer:
 
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'tex')
 
-    def draw_mesh(self, mesh: Mesh, proj_view):
+    def draw_mesh(self, mesh: Mesh, proj_view, alpha: float = 1.0):
         if not hasattr(mesh, "_gpu"):
             if mesh.uvs is not None and mesh.texture_id is not None:
                 self._build_gpu_tex(mesh)
@@ -1718,6 +2009,7 @@ class Renderer:
                 self._bound_kind = 'color'
                 self._bound_texture_id = None
             self.prog_color['u_mvp'] = mvp
+            self.prog_color['u_alpha'] = alpha
 
         if self._bound_vao != vao.value:
             gl.glBindVertexArray(vao)
@@ -1793,6 +2085,11 @@ class AVHMI(pyglet.window.Window):
         self.perception_bridge = ROSPerceptionBridge()
         self._last_lane_stamp = 0.0
         self.lane_meshes: List[Mesh] = []
+        self.stopbar_mesh: Optional[Mesh] = None
+        self.stopbar_distance: Optional[float] = None
+        self._last_stopbar_stamp = 0.0
+        self.driveable_polygon_mesh: Optional[Mesh] = None
+        self._last_driveable_polygon_stamp = 0.0
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -2423,6 +2720,56 @@ class AVHMI(pyglet.window.Window):
         if self._should_update_orientation_this_frame():
             self._snap_vehicle_orientations_to_lanes()
 
+    def _sync_stopbar(self, depth: Optional[float]):
+        if depth is None:
+            self.stopbar_mesh = None
+            self.stopbar_distance = None
+            return
+
+        try:
+            distance = float(depth)
+        except (TypeError, ValueError):
+            self.stopbar_mesh = None
+            self.stopbar_distance = None
+            return
+
+        if not math.isfinite(distance) or distance <= 0.1 or distance >= 9000.0:
+            self.stopbar_mesh = None
+            self.stopbar_distance = None
+            return
+
+        verts, cols = make_ground_rect(
+            STOPBAR_WIDTH_M,
+            STOPBAR_THICKNESS_M,
+            -distance,
+            STOPBAR_RENDER_LIFT_M,
+            color=(1.0, 1.0, 1.0),
+        )
+        self.stopbar_mesh = Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.warm_mesh(self.stopbar_mesh)
+        self.stopbar_distance = distance
+
+    def _sync_driveable_polygon(self, points: List[Tuple[float, float, float]]):
+        local_points = []
+        for point in points:
+            if len(point) < 3:
+                continue
+            forward = float(point[0])
+            left = float(point[1])
+            if not all(math.isfinite(v) and abs(v) < 9000.0 for v in (forward, left)):
+                continue
+            local_pose = self._sensor_depth_to_local_pose(forward, left, 0.0, lateral_offset=0.0)
+            local_pose[1] = DRIVEABLE_POLYGON_RENDER_LIFT_M
+            local_points.append(tuple(local_pose))
+
+        verts, cols = triangulate_polygon_fan(local_points, color=(0.46, 0.46, 0.46))
+        if not verts:
+            self.driveable_polygon_mesh = None
+            return
+
+        self.driveable_polygon_mesh = Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.warm_mesh(self.driveable_polygon_mesh)
+
     def _make_mesh_actor(self, mesh: Mesh):
         return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
 
@@ -2431,7 +2778,8 @@ class AVHMI(pyglet.window.Window):
             return
         if isinstance(actor, StreetSign):
             self.renderer.warm_mesh(actor.pole_mesh)
-            self.renderer.warm_mesh(actor.panel_mesh)
+            for mesh in actor.panel_meshes:
+                self.renderer.warm_mesh(mesh)
             return
         if isinstance(actor, TrafficLight):
             self.renderer.warm_mesh(actor.mesh)
@@ -2446,12 +2794,21 @@ class AVHMI(pyglet.window.Window):
         obj_class = int(detection["obj_class"])
         custom = int(detection.get("custom_classification", 0))
         if obj_class == 6:
-            if custom == 5:
-                return (obj_class, "stop")
-            if custom == 9:
-                return (obj_class, "yield")
-            return (obj_class, "speed")
+            return (obj_class, self._sign_kind_for_custom_classification(custom))
         return (obj_class,)
+
+    def _sign_kind_for_custom_classification(self, custom: int) -> str:
+        return {
+            4: "speed",
+            5: "stop",
+            6: "no_right",
+            7: "no_left",
+            8: "do_not_enter",
+            9: "one_way",
+            10: "pedestrian",
+            11: "railroad",
+            15: "yield",
+        }.get(int(custom), "unknown")
 
     def _build_fallback_actor(self, obj_class: int, detection: Dict[str, float]):
         height = float(detection.get("height", 0.0))
@@ -2496,12 +2853,8 @@ class AVHMI(pyglet.window.Window):
         if obj_class == 5:
             return TrafficLight(0.0, 0.0, 0.0, state=custom)
         if obj_class == 6:
-            sign_kind = "speed"
-            if custom == 5:
-                sign_kind = "stop"
-            elif custom == 9:
-                sign_kind = "yield"
-            return StreetSign(sign_kind, 0.0, 0.0, 0.0, yaw=math.pi)
+            sign_kind = self._sign_kind_for_custom_classification(custom)
+            return StreetSign(sign_kind, 0.0, 0.0, 0.0)
         if obj_class == 7 and "barrel" in self.detected_mesh_templates:
             return self._make_mesh_actor(self.detected_mesh_templates["barrel"])
         if obj_class == 9 and "cone" in self.detected_mesh_templates:
@@ -2698,6 +3051,16 @@ class AVHMI(pyglet.window.Window):
             self.coord_label.draw()
         gl.glEnable(gl.GL_DEPTH_TEST)
 
+    def _draw_translucent_mesh(self, mesh: Mesh, pv, alpha: float):
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDepthMask(gl.GL_FALSE)
+        try:
+            self.renderer.draw_mesh(mesh, pv, alpha=alpha)
+        finally:
+            gl.glDepthMask(gl.GL_TRUE)
+            gl.glDisable(gl.GL_BLEND)
+
     def _current_ground_speed_mps(self):
         if self._last_detection_stamp > 0.0:
             age = time.perf_counter() - self._last_detection_stamp
@@ -2725,6 +3088,25 @@ class AVHMI(pyglet.window.Window):
         if lane_stamp > self._last_lane_stamp:
             self._sync_lane_lines(lanes)
             self._last_lane_stamp = lane_stamp
+
+        stopbar_stamp, stopbar_depth = self.perception_bridge.latest_stopbar_snapshot()
+        if stopbar_stamp > self._last_stopbar_stamp:
+            self._sync_stopbar(stopbar_depth)
+            self._last_stopbar_stamp = stopbar_stamp
+
+        if self.stopbar_mesh is not None and self._last_stopbar_stamp > 0.0:
+            if time.perf_counter() - self._last_stopbar_stamp > STOPBAR_FRESHNESS_SEC:
+                self.stopbar_mesh = None
+                self.stopbar_distance = None
+
+        polygon_stamp, driveable_polygon = self.perception_bridge.latest_driveable_polygon_snapshot()
+        if polygon_stamp > self._last_driveable_polygon_stamp:
+            self._sync_driveable_polygon(driveable_polygon)
+            self._last_driveable_polygon_stamp = polygon_stamp
+
+        if self.driveable_polygon_mesh is not None and self._last_driveable_polygon_stamp > 0.0:
+            if time.perf_counter() - self._last_driveable_polygon_stamp > DRIVEABLE_POLYGON_FRESHNESS_SEC:
+                self.driveable_polygon_mesh = None
 
         throttle  = 1.0 if self.keys[key.W] else 0.0
         brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
@@ -2789,9 +3171,17 @@ class AVHMI(pyglet.window.Window):
         car_R = mat4_rotate_y(self.ego.yaw)
         car_M = mat4_mul(car_T, car_R)
 
+        if self.driveable_polygon_mesh is not None:
+            self.driveable_polygon_mesh.model = car_M
+            self._draw_translucent_mesh(self.driveable_polygon_mesh, pv, alpha=0.34)
+
         for ln in self.lane_meshes:
             ln.model = car_M
             self.renderer.draw_mesh(ln, pv)
+
+        if self.stopbar_mesh is not None:
+            self.stopbar_mesh.model = car_M
+            self.renderer.draw_mesh(self.stopbar_mesh, pv)
 
         # Draw car
         if self.car_mesh:
@@ -2830,7 +3220,8 @@ class AVHMI(pyglet.window.Window):
         # Draw street signs
         for ss in self.street_signs:
             self.renderer.draw_mesh(ss.pole_mesh, pv)
-            self.renderer.draw_mesh(ss.panel_mesh, pv)
+            for mesh in ss.panel_meshes:
+                self.renderer.draw_mesh(mesh, pv)
 
         # Draw characters
         for ch in self.characters:
@@ -2843,12 +3234,14 @@ class AVHMI(pyglet.window.Window):
         self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
 
         ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
+        stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
         self.hud.text = (
             f"Sim Speed {self.ego.v:4.1f} m/s   "
             f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
             f"{ros_status}   "
             f"Objects {len(self.detected_entities)}   "
-            f"Lanes {self._latest_lane_count}"
+            f"Lanes {self._latest_lane_count}   "
+            f"{stopbar_status}"
         )
         self.hud.draw()
         
