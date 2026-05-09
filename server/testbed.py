@@ -385,6 +385,10 @@ def translate_mesh(verts, dx: float, dy: float, dz: float):
     return [(x + dx, y + dy, z + dz) for x, y, z in verts]
 
 
+def rotate_mesh_y_180(verts):
+    return [(-x, y, -z) for x, y, z in verts]
+
+
 def make_circular_lens(radius: float, depth: float, color=(0.9, 0.1, 0.1), segments: int = 24):
     """Create a shallow circular lens facing +Z."""
     front_z = depth * 0.5
@@ -2059,7 +2063,7 @@ class AVHMI(pyglet.window.Window):
                 model_h = max(1e-6, cymax - cymin)
                 desired_h = 1.4
                 s = desired_h / model_h
-                cpos_scaled = center_ground_mesh_vertices([(x*s, (y - cymin)*s, z*s) for (x, y, z) in cpos])
+                cpos_scaled = rotate_mesh_y_180(center_ground_mesh_vertices([(x*s, (y - cymin)*s, z*s) for (x, y, z) in cpos]))
                 gray_cols = recolor_car_mesh_colors(cpos_scaled, ccol, self.detected_car_color)
                 car_mesh = Mesh(cpos_scaled, gray_cols, None, None, gl.GL_TRIANGLES, mat4_translate(-2.0, 0.0, -8.0))
                 
@@ -2099,7 +2103,7 @@ class AVHMI(pyglet.window.Window):
                 cx = (cxmin + cxmax) * 0.5
                 cz = (czmin + czmax) * 0.5
                 
-                cpos_scaled = [((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cpos]
+                cpos_scaled = rotate_mesh_y_180([((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cpos])
 
                 # Position it next to the truck
                 car_x, car_y, car_z = -7, 0.0, -8.0
