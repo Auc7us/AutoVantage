@@ -547,15 +547,67 @@ def make_ground_rect(width: float, thickness: float, center_z: float, lift: floa
     return verts, [color] * len(verts)
 
 
-def triangulate_polygon_fan(points, color=(0.46, 0.46, 0.46)):
-    if len(points) < 3:
+def triangulate_polygon(points, color=(0.46, 0.46, 0.46)):
+    eps = 1e-6
+    polygon = []
+    for point in points:
+        if not polygon or math.hypot(point[0] - polygon[-1][0], point[2] - polygon[-1][2]) > eps:
+            polygon.append(point)
+    if len(polygon) > 1 and math.hypot(polygon[0][0] - polygon[-1][0], polygon[0][2] - polygon[-1][2]) <= eps:
+        polygon.pop()
+    if len(polygon) < 3:
         return [], []
+
+    def signed_area():
+        area = 0.0
+        for i, point in enumerate(polygon):
+            next_point = polygon[(i + 1) % len(polygon)]
+            area += point[0] * next_point[2] - next_point[0] * point[2]
+        return area * 0.5
+
+    if signed_area() < 0.0:
+        polygon.reverse()
+
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0])
+
+    def point_in_triangle(point, a, b, c):
+        return (
+            cross(a, b, point) >= -eps
+            and cross(b, c, point) >= -eps
+            and cross(c, a, point) >= -eps
+        )
+
+    def add_triangle(a, b, c):
+        verts.extend((a, b, c))
+        cols.extend((color, color, color))
+
     verts = []
     cols = []
-    anchor = points[0]
-    for i in range(1, len(points) - 1):
-        verts.extend([anchor, points[i], points[i + 1]])
-        cols.extend([color, color, color])
+    remaining = list(range(len(polygon)))
+
+    while len(remaining) > 3:
+        for pos, curr_idx in enumerate(remaining):
+            prev_idx = remaining[pos - 1]
+            next_idx = remaining[(pos + 1) % len(remaining)]
+            a = polygon[prev_idx]
+            b = polygon[curr_idx]
+            c = polygon[next_idx]
+            if cross(a, b, c) <= eps:
+                continue
+            if any(
+                point_in_triangle(polygon[test_idx], a, b, c)
+                for test_idx in remaining
+                if test_idx not in (prev_idx, curr_idx, next_idx)
+            ):
+                continue
+            add_triangle(a, b, c)
+            del remaining[pos]
+            break
+        else:
+            return [], []
+
+    add_triangle(polygon[remaining[0]], polygon[remaining[1]], polygon[remaining[2]])
     return verts, cols
 
 def make_grid(size=80, step=2.0, color=(0.25, 0.25, 0.25)):
@@ -2762,7 +2814,7 @@ class AVHMI(pyglet.window.Window):
             local_pose[1] = DRIVEABLE_POLYGON_RENDER_LIFT_M
             local_points.append(tuple(local_pose))
 
-        verts, cols = triangulate_polygon_fan(local_points, color=(0.46, 0.46, 0.46))
+        verts, cols = triangulate_polygon(local_points, color=(0.46, 0.46, 0.46))
         if not verts:
             self.driveable_polygon_mesh = None
             return
