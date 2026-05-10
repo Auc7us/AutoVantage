@@ -12,7 +12,7 @@ from pyglet.graphics.shader import Shader, ShaderProgram
 try:
     import rclpy
     from rclpy.node import Node
-    from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth
+    from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth, SpatialMap
     from geometry_msgs.msg import PolygonStamped
     ROS2_AVAILABLE = True
 except ImportError:
@@ -21,6 +21,7 @@ except ImportError:
     ObjectArray = None
     LaneArray = None
     StopbarDepth = None
+    SpatialMap = None
     PolygonStamped = None
     ROS2_AVAILABLE = False
 
@@ -68,6 +69,11 @@ STOPBAR_THICKNESS_M = 0.38
 STOPBAR_FRESHNESS_SEC = 0.8
 DRIVEABLE_POLYGON_RENDER_LIFT_M = 0.02
 DRIVEABLE_POLYGON_FRESHNESS_SEC = 0.8
+SPATIAL_MAP_RENDER_LIFT_M = 0.025
+SPATIAL_MAP_FRESHNESS_SEC = 0.8
+SPATIAL_MAP_CELL_COLOR = (0.86, 0.55, 0.55)
+SPATIAL_MAP_RENDER_ALPHA = 0.55
+SPATIAL_MAP_MAX_RANGE_M = 80.0
 SIGN_OVERLAY_EGO_FACE_OFFSET_M = -0.036
 SIGN_OVERLAY_LAYER_STEP_M = 0.006
 LANE_ORIENTATION_CLASSES = {1, 11, 13}
@@ -1240,16 +1246,19 @@ class PerceptionSubscriber(Node):
         on_lanes,
         on_stopbar,
         on_driveable_polygon,
+        on_spatial_map,
         object_topic="/perception/objectdetection",
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
         driveable_polygon_topic="/perception/driveable_polygon",
+        spatial_map_topic="/perception/spatial_map",
     ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
         self._on_lanes = on_lanes
         self._on_stopbar = on_stopbar
         self._on_driveable_polygon = on_driveable_polygon
+        self._on_spatial_map = on_spatial_map
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -1274,6 +1283,14 @@ class PerceptionSubscriber(Node):
             self._driveable_polygon_callback,
             10,
         )
+        self.spatial_map_subscription = None
+        if SpatialMap is not None:
+            self.spatial_map_subscription = self.create_subscription(
+                SpatialMap,
+                spatial_map_topic,
+                self._spatial_map_callback,
+                10,
+            )
 
     def _object_callback(self, msg):
         objects = []
@@ -1311,6 +1328,13 @@ class PerceptionSubscriber(Node):
         for point in msg.polygon.points:
             points.append((float(point.x), float(point.y), float(point.z)))
         self._on_driveable_polygon(points)
+
+    def _spatial_map_callback(self, msg):
+        cell_size = float(msg.cell_size)
+        points = []
+        for point in msg.green_points:
+            points.append((float(point.x), float(point.y)))
+        self._on_spatial_map(cell_size, points)
 
 
 class ROSObjectDetectionBridge:
@@ -1419,6 +1443,7 @@ class ROSPerceptionBridge:
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
         driveable_polygon_topic="/perception/driveable_polygon",
+        spatial_map_topic="/perception/spatial_map",
     ):
         self.enabled = False
         self.node = None
@@ -1429,10 +1454,13 @@ class ROSPerceptionBridge:
         self._latest_lane_stamp = 0.0
         self._latest_stopbar_stamp = 0.0
         self._latest_driveable_polygon_stamp = 0.0
+        self._latest_spatial_map_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
         self._latest_stopbar_depth: Optional[float] = None
         self._latest_driveable_polygon: List[Tuple[float, float, float]] = []
+        self._latest_spatial_map_cell_size: float = 0.0
+        self._latest_spatial_map_points: List[Tuple[float, float]] = []
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1446,10 +1474,12 @@ class ROSPerceptionBridge:
                 self._store_lanes,
                 self._store_stopbar,
                 self._store_driveable_polygon,
+                self._store_spatial_map,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
                 stopbar_topic=stopbar_topic,
                 driveable_polygon_topic=driveable_polygon_topic,
+                spatial_map_topic=spatial_map_topic,
             )
             self.enabled = True
             self._spin_thread = threading.Thread(
@@ -1458,7 +1488,10 @@ class ROSPerceptionBridge:
                 daemon=True,
             )
             self._spin_thread.start()
-            print(f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', '{stopbar_topic}', and '{driveable_polygon_topic}'")
+            print(
+                f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
+                f"'{stopbar_topic}', '{driveable_polygon_topic}', and '{spatial_map_topic}'"
+            )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
             self.enabled = False
@@ -1482,6 +1515,12 @@ class ROSPerceptionBridge:
         with self._lock:
             self._latest_driveable_polygon = points
             self._latest_driveable_polygon_stamp = time.perf_counter()
+
+    def _store_spatial_map(self, cell_size, points):
+        with self._lock:
+            self._latest_spatial_map_cell_size = cell_size
+            self._latest_spatial_map_points = points
+            self._latest_spatial_map_stamp = time.perf_counter()
 
     def _spin_loop(self):
         while not self._stop_event.is_set() and self.enabled and self.node is not None:
@@ -1510,6 +1549,14 @@ class ROSPerceptionBridge:
     def latest_driveable_polygon_snapshot(self):
         with self._lock:
             return self._latest_driveable_polygon_stamp, list(self._latest_driveable_polygon)
+
+    def latest_spatial_map_snapshot(self):
+        with self._lock:
+            return (
+                self._latest_spatial_map_stamp,
+                self._latest_spatial_map_cell_size,
+                list(self._latest_spatial_map_points),
+            )
 
     def close(self):
         self._stop_event.set()
@@ -2406,6 +2453,14 @@ class AVHMI(pyglet.window.Window):
         self._pending_driveable_polygon: List[Tuple[float, float, float]] = []
         self._last_driveable_polygon_geometry_sync_time = 0.0
         self._driveable_polygon_visible = False
+        self.spatial_map_mesh: Optional[Mesh] = None
+        self._last_spatial_map_stamp = 0.0
+        self._pending_spatial_map_stamp = 0.0
+        self._pending_spatial_map_cell_size = 0.0
+        self._pending_spatial_map_points: List[Tuple[float, float]] = []
+        self._last_spatial_map_geometry_sync_time = 0.0
+        self._spatial_map_visible = False
+        self._latest_spatial_map_cell_count = 0
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -3100,6 +3155,50 @@ class AVHMI(pyglet.window.Window):
         self.renderer.update_color_mesh(self.driveable_polygon_mesh, verts, cols, gl.GL_TRIANGLES)
         self._driveable_polygon_visible = True
 
+    def _sync_spatial_map(self, cell_size: float, points: List[Tuple[float, float]]):
+        if not math.isfinite(cell_size) or cell_size <= 1e-3:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
+            return
+
+        half = cell_size * 0.5
+        lift = SPATIAL_MAP_RENDER_LIFT_M
+        color = SPATIAL_MAP_CELL_COLOR
+        max_range_sq = SPATIAL_MAP_MAX_RANGE_M * SPATIAL_MAP_MAX_RANGE_M
+
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+
+        for point in points:
+            forward = float(point[0])
+            left = float(point[1])
+            if not (math.isfinite(forward) and math.isfinite(left)):
+                continue
+            if forward * forward + left * left > max_range_sq:
+                continue
+
+            local_pose = self._sensor_depth_to_local_pose(forward, left, 0.0, lateral_offset=0.0)
+            cx = local_pose[0]
+            cz = local_pose[2]
+            x0, x1 = cx - half, cx + half
+            z0, z1 = cz - half, cz + half
+            verts.extend((
+                (x0, lift, z0), (x1, lift, z0), (x1, lift, z1),
+                (x0, lift, z0), (x1, lift, z1), (x0, lift, z1),
+            ))
+            cols.extend((color, color, color, color, color, color))
+
+        if not verts:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
+            return
+
+        if self.spatial_map_mesh is None:
+            self.spatial_map_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.spatial_map_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._spatial_map_visible = True
+        self._latest_spatial_map_cell_count = len(verts) // 6
+
     def _make_mesh_actor(self, mesh: Mesh):
         return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
 
@@ -3449,6 +3548,9 @@ class AVHMI(pyglet.window.Window):
             lane_stamp, lanes = self.perception_bridge.latest_lane_snapshot()
             stopbar_stamp, stopbar_depth = self.perception_bridge.latest_stopbar_snapshot()
             polygon_stamp, driveable_polygon = self.perception_bridge.latest_driveable_polygon_snapshot()
+            spatial_map_stamp, spatial_map_cell_size, spatial_map_points = (
+                self.perception_bridge.latest_spatial_map_snapshot()
+            )
 
         if detection_stamp > self._last_detection_stamp:
             with self.profiler.section("sync_objects"):
@@ -3491,6 +3593,26 @@ class AVHMI(pyglet.window.Window):
         if self.driveable_polygon_mesh is not None and self._last_driveable_polygon_stamp > 0.0:
             if time.perf_counter() - self._last_driveable_polygon_stamp > DRIVEABLE_POLYGON_FRESHNESS_SEC:
                 self._driveable_polygon_visible = False
+
+        if spatial_map_stamp > self._pending_spatial_map_stamp:
+            self._pending_spatial_map_stamp = spatial_map_stamp
+            self._pending_spatial_map_cell_size = spatial_map_cell_size
+            self._pending_spatial_map_points = spatial_map_points
+        if (
+            self._pending_spatial_map_stamp > self._last_spatial_map_stamp
+            and now - self._last_spatial_map_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_spatial_map"):
+                self._sync_spatial_map(
+                    self._pending_spatial_map_cell_size,
+                    self._pending_spatial_map_points,
+                )
+            self._last_spatial_map_stamp = self._pending_spatial_map_stamp
+            self._last_spatial_map_geometry_sync_time = now
+
+        if self.spatial_map_mesh is not None and self._last_spatial_map_stamp > 0.0:
+            if time.perf_counter() - self._last_spatial_map_stamp > SPATIAL_MAP_FRESHNESS_SEC:
+                self._spatial_map_visible = False
 
         with self.profiler.section("simulation"):
             throttle  = 1.0 if self.keys[key.W] else 0.0
@@ -3559,6 +3681,10 @@ class AVHMI(pyglet.window.Window):
             self.driveable_polygon_mesh.model = car_M
             self._draw_translucent_mesh(self.driveable_polygon_mesh, pv, alpha=0.34)
 
+        if self.spatial_map_mesh is not None and self._spatial_map_visible:
+            self.spatial_map_mesh.model = car_M
+            self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
+
         for ln in self.lane_meshes:
             ln.model = car_M
             self.renderer.draw_mesh(ln, pv)
@@ -3618,13 +3744,19 @@ class AVHMI(pyglet.window.Window):
 
             ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
             stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
+            som_status = (
+                f"SOM {self._latest_spatial_map_cell_count}"
+                if self._spatial_map_visible
+                else "SOM --"
+            )
             self.hud.text = (
                 f"Sim Speed {self.ego.v:4.1f} m/s   "
                 f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
                 f"{ros_status}   "
                 f"Objects {len(self.detected_entities)}   "
                 f"Lanes {self._latest_lane_count}   "
-                f"{stopbar_status}"
+                f"{stopbar_status}   "
+                f"{som_status}"
             )
             self.hud.draw()
         
