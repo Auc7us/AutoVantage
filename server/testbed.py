@@ -3641,11 +3641,11 @@ class AVHMI(pyglet.window.Window):
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    stream_fps = read_int_env("WAUTOVANTAGE_STREAM_FPS", 24)
+    stream_fps = read_int_env("WAUTOVANTAGE_STREAM_FPS", 30)
     stream_queue_size = read_int_env("WAUTOVANTAGE_STREAM_QUEUE_SIZE", 1)
     stream_keyframe_interval = read_int_env(
         "WAUTOVANTAGE_STREAM_GOP",
-        max(10, stream_fps // 2)
+        1
     )
     stream_mode = read_str_env("WAUTOVANTAGE_STREAM_MODE", "mpegts").lower()
     stream_host = read_str_env("WAUTOVANTAGE_STREAM_HOST", "127.0.0.1")

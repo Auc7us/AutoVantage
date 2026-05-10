@@ -191,6 +191,7 @@ def integrate_with_testbed():
         fps=30,
         rtp_host="127.0.0.1",
         rtp_port=5000,
+        keyframe_interval=1,
         stream_mode="mpegts"
     )
     
@@ -201,7 +202,7 @@ if __name__ == "__main__":
     print("Testing H.264 Streaming Integration")
     print("=" * 40)
     
-    streaming = StreamingIntegration(stream_mode="mpegts")
+    streaming = StreamingIntegration(stream_mode="mpegts", keyframe_interval=1)
     
     if streaming.streamer and streaming.streamer.is_active:
         print("Integration test successful - streaming ready")
