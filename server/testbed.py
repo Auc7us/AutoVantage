@@ -2422,6 +2422,7 @@ class AVHMI(pyglet.window.Window):
             anchor_y="bottom",
             color=(235, 245, 255, 230),
         )
+        self.show_labels = read_bool_env("WAUTOVANTAGE_SHOW_LABELS", False)
         self.profiler = FrameProfiler(
             read_bool_env("WAUTOVANTAGE_PROFILE", False),
             read_float_env("WAUTOVANTAGE_PROFILE_INTERVAL", 2.0, minimum=0.25),
@@ -2453,6 +2454,7 @@ class AVHMI(pyglet.window.Window):
         self._pending_driveable_polygon: List[Tuple[float, float, float]] = []
         self._last_driveable_polygon_geometry_sync_time = 0.0
         self._driveable_polygon_visible = False
+        self.show_spatial_map = read_bool_env("WAUTOVANTAGE_SHOW_SPATIAL_MAP", True)
         self.spatial_map_mesh: Optional[Mesh] = None
         self._last_spatial_map_stamp = 0.0
         self._pending_spatial_map_stamp = 0.0
@@ -3594,25 +3596,29 @@ class AVHMI(pyglet.window.Window):
             if time.perf_counter() - self._last_driveable_polygon_stamp > DRIVEABLE_POLYGON_FRESHNESS_SEC:
                 self._driveable_polygon_visible = False
 
-        if spatial_map_stamp > self._pending_spatial_map_stamp:
-            self._pending_spatial_map_stamp = spatial_map_stamp
-            self._pending_spatial_map_cell_size = spatial_map_cell_size
-            self._pending_spatial_map_points = spatial_map_points
-        if (
-            self._pending_spatial_map_stamp > self._last_spatial_map_stamp
-            and now - self._last_spatial_map_geometry_sync_time >= self._perception_geometry_min_interval
-        ):
-            with self.profiler.section("mesh_spatial_map"):
-                self._sync_spatial_map(
-                    self._pending_spatial_map_cell_size,
-                    self._pending_spatial_map_points,
-                )
-            self._last_spatial_map_stamp = self._pending_spatial_map_stamp
-            self._last_spatial_map_geometry_sync_time = now
+        if self.show_spatial_map:
+            if spatial_map_stamp > self._pending_spatial_map_stamp:
+                self._pending_spatial_map_stamp = spatial_map_stamp
+                self._pending_spatial_map_cell_size = spatial_map_cell_size
+                self._pending_spatial_map_points = spatial_map_points
+            if (
+                self._pending_spatial_map_stamp > self._last_spatial_map_stamp
+                and now - self._last_spatial_map_geometry_sync_time >= self._perception_geometry_min_interval
+            ):
+                with self.profiler.section("mesh_spatial_map"):
+                    self._sync_spatial_map(
+                        self._pending_spatial_map_cell_size,
+                        self._pending_spatial_map_points,
+                    )
+                self._last_spatial_map_stamp = self._pending_spatial_map_stamp
+                self._last_spatial_map_geometry_sync_time = now
 
-        if self.spatial_map_mesh is not None and self._last_spatial_map_stamp > 0.0:
-            if time.perf_counter() - self._last_spatial_map_stamp > SPATIAL_MAP_FRESHNESS_SEC:
-                self._spatial_map_visible = False
+            if self.spatial_map_mesh is not None and self._last_spatial_map_stamp > 0.0:
+                if time.perf_counter() - self._last_spatial_map_stamp > SPATIAL_MAP_FRESHNESS_SEC:
+                    self._spatial_map_visible = False
+        else:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
 
         with self.profiler.section("simulation"):
             throttle  = 1.0 if self.keys[key.W] else 0.0
@@ -3681,7 +3687,7 @@ class AVHMI(pyglet.window.Window):
             self.driveable_polygon_mesh.model = car_M
             self._draw_translucent_mesh(self.driveable_polygon_mesh, pv, alpha=0.34)
 
-        if self.spatial_map_mesh is not None and self._spatial_map_visible:
+        if self.show_spatial_map and self.spatial_map_mesh is not None and self._spatial_map_visible:
             self.spatial_map_mesh.model = car_M
             self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
 
@@ -3739,26 +3745,27 @@ class AVHMI(pyglet.window.Window):
 
         self._draw_detected_entities(pv, car_M)
 
-        with self.profiler.section("labels"):
-            self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
+        if self.show_labels:
+            with self.profiler.section("labels"):
+                self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
 
-            ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
-            stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
-            som_status = (
-                f"SOM {self._latest_spatial_map_cell_count}"
-                if self._spatial_map_visible
-                else "SOM --"
-            )
-            self.hud.text = (
-                f"Sim Speed {self.ego.v:4.1f} m/s   "
-                f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
-                f"{ros_status}   "
-                f"Objects {len(self.detected_entities)}   "
-                f"Lanes {self._latest_lane_count}   "
-                f"{stopbar_status}   "
-                f"{som_status}"
-            )
-            self.hud.draw()
+                ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
+                stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
+                som_status = (
+                    f"SOM {self._latest_spatial_map_cell_count}"
+                    if self._spatial_map_visible
+                    else "SOM --"
+                )
+                self.hud.text = (
+                    f"Sim Speed {self.ego.v:4.1f} m/s   "
+                    f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
+                    f"{ros_status}   "
+                    f"Objects {len(self.detected_entities)}   "
+                    f"Lanes {self._latest_lane_count}   "
+                    f"{stopbar_status}   "
+                    f"{som_status}"
+                )
+                self.hud.draw()
         
         if hasattr(self, 'streaming'):
             with self.profiler.section("streaming"):
