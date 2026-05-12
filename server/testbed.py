@@ -14,6 +14,11 @@ try:
     from rclpy.node import Node
     from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth, SpatialMap
     from geometry_msgs.msg import PolygonStamped
+    from nav_msgs.msg import Path as NavPath
+    try:
+        from visualization_msgs.msg import MarkerArray
+    except ImportError:
+        MarkerArray = None
     ROS2_AVAILABLE = True
 except ImportError:
     rclpy = None
@@ -23,6 +28,8 @@ except ImportError:
     StopbarDepth = None
     SpatialMap = None
     PolygonStamped = None
+    NavPath = None
+    MarkerArray = None
     ROS2_AVAILABLE = False
 
 
@@ -74,6 +81,17 @@ SPATIAL_MAP_FRESHNESS_SEC = 0.8
 SPATIAL_MAP_CELL_COLOR = (0.86, 0.55, 0.55)
 SPATIAL_MAP_RENDER_ALPHA = 0.55
 SPATIAL_MAP_MAX_RANGE_M = 80.0
+REFERENCE_PATH_TOPIC = "/y5_mid_planner/debug/reference_path"
+REFERENCE_PATH_RENDER_LIFT_M = 0.09
+REFERENCE_PATH_WIDTH_M = 0.24
+REFERENCE_PATH_COLOR = (0.0, 0.92, 1.0)
+REFERENCE_PATH_FRESHNESS_SEC = 2.0
+GROUND_TRUTH_LANE_TOPIC = "/y5_mid_planner/debug/restrictions"
+GROUND_TRUTH_LANE_RENDER_LIFT_M = 0.065
+GROUND_TRUTH_LANE_WIDTH_M = 0.15
+GROUND_TRUTH_LANE_COLOR = (0.0, 1.0, 0.30)
+GROUND_TRUTH_LANE_RENDER_ALPHA = 0.32
+GROUND_TRUTH_LANE_FRESHNESS_SEC = 0.6
 SIGN_OVERLAY_EGO_FACE_OFFSET_M = -0.036
 SIGN_OVERLAY_LAYER_STEP_M = 0.006
 LANE_ORIENTATION_CLASSES = {1, 11, 13}
@@ -126,6 +144,13 @@ def read_str_env(name: str, default: str) -> str:
         return default
     value = value.strip()
     return value if value else default
+
+
+def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
+    return math.atan2(
+        2.0 * ((w * z) + (x * y)),
+        1.0 - (2.0 * ((y * y) + (z * z))),
+    )
 
 
 class FrameProfiler:
@@ -1247,11 +1272,15 @@ class PerceptionSubscriber(Node):
         on_stopbar,
         on_driveable_polygon,
         on_spatial_map,
+        on_reference_path,
+        on_ground_truth_lanes,
         object_topic="/perception/objectdetection",
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
         driveable_polygon_topic="/perception/driveable_polygon",
         spatial_map_topic="/perception/spatial_map",
+        reference_path_topic=REFERENCE_PATH_TOPIC,
+        ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
     ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
@@ -1259,6 +1288,8 @@ class PerceptionSubscriber(Node):
         self._on_stopbar = on_stopbar
         self._on_driveable_polygon = on_driveable_polygon
         self._on_spatial_map = on_spatial_map
+        self._on_reference_path = on_reference_path
+        self._on_ground_truth_lanes = on_ground_truth_lanes
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -1289,6 +1320,22 @@ class PerceptionSubscriber(Node):
                 SpatialMap,
                 spatial_map_topic,
                 self._spatial_map_callback,
+                10,
+            )
+        self.reference_path_subscription = None
+        if NavPath is not None:
+            self.reference_path_subscription = self.create_subscription(
+                NavPath,
+                reference_path_topic,
+                self._reference_path_callback,
+                10,
+            )
+        self.ground_truth_lane_subscription = None
+        if MarkerArray is not None:
+            self.ground_truth_lane_subscription = self.create_subscription(
+                MarkerArray,
+                ground_truth_lane_topic,
+                self._ground_truth_lane_callback,
                 10,
             )
 
@@ -1335,6 +1382,52 @@ class PerceptionSubscriber(Node):
         for point in msg.green_points:
             points.append((float(point.x), float(point.y)))
         self._on_spatial_map(cell_size, points)
+
+    def _reference_path_callback(self, msg):
+        poses = []
+        for stamped_pose in msg.poses:
+            position = stamped_pose.pose.position
+            orientation = stamped_pose.pose.orientation
+            enu_yaw = yaw_from_quaternion_xyzw(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            )
+            poses.append((float(position.x), float(position.y), float(position.z), enu_yaw))
+        self._on_reference_path(poses)
+
+    def _ground_truth_lane_callback(self, msg):
+        lanes = []
+        vehicle_pose = None
+        for marker in msg.markers:
+            namespace = str(getattr(marker, "ns", ""))
+            if namespace == "vehicle_pose":
+                position = marker.pose.position
+                orientation = marker.pose.orientation
+                vehicle_pose = (
+                    float(position.x),
+                    float(position.y),
+                    float(position.z),
+                    yaw_from_quaternion_xyzw(
+                        float(orientation.x),
+                        float(orientation.y),
+                        float(orientation.z),
+                        float(orientation.w),
+                    ),
+                )
+                continue
+            if not namespace.startswith("lane_"):
+                continue
+            points = []
+            for point in marker.points:
+                points.append((float(point.x), float(point.y), float(point.z)))
+            if points:
+                lanes.append({
+                    "ns": namespace,
+                    "points": points,
+                })
+        self._on_ground_truth_lanes(vehicle_pose, lanes)
 
 
 class ROSObjectDetectionBridge:
@@ -1444,6 +1537,8 @@ class ROSPerceptionBridge:
         stopbar_topic="/perception/stopbar",
         driveable_polygon_topic="/perception/driveable_polygon",
         spatial_map_topic="/perception/spatial_map",
+        reference_path_topic=REFERENCE_PATH_TOPIC,
+        ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
     ):
         self.enabled = False
         self.node = None
@@ -1455,12 +1550,17 @@ class ROSPerceptionBridge:
         self._latest_stopbar_stamp = 0.0
         self._latest_driveable_polygon_stamp = 0.0
         self._latest_spatial_map_stamp = 0.0
+        self._latest_reference_path_stamp = 0.0
+        self._latest_ground_truth_lane_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
         self._latest_stopbar_depth: Optional[float] = None
         self._latest_driveable_polygon: List[Tuple[float, float, float]] = []
         self._latest_spatial_map_cell_size: float = 0.0
         self._latest_spatial_map_points: List[Tuple[float, float]] = []
+        self._latest_reference_path: List[Tuple[float, ...]] = []
+        self._latest_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
+        self._latest_ground_truth_lanes: List[Dict[str, object]] = []
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1475,11 +1575,15 @@ class ROSPerceptionBridge:
                 self._store_stopbar,
                 self._store_driveable_polygon,
                 self._store_spatial_map,
+                self._store_reference_path,
+                self._store_ground_truth_lanes,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
                 stopbar_topic=stopbar_topic,
                 driveable_polygon_topic=driveable_polygon_topic,
                 spatial_map_topic=spatial_map_topic,
+                reference_path_topic=reference_path_topic,
+                ground_truth_lane_topic=ground_truth_lane_topic,
             )
             self.enabled = True
             self._spin_thread = threading.Thread(
@@ -1490,7 +1594,8 @@ class ROSPerceptionBridge:
             self._spin_thread.start()
             print(
                 f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
-                f"'{stopbar_topic}', '{driveable_polygon_topic}', and '{spatial_map_topic}'"
+                f"'{stopbar_topic}', '{driveable_polygon_topic}', '{spatial_map_topic}', "
+                f"'{reference_path_topic}', and '{ground_truth_lane_topic}'"
             )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
@@ -1521,6 +1626,17 @@ class ROSPerceptionBridge:
             self._latest_spatial_map_cell_size = cell_size
             self._latest_spatial_map_points = points
             self._latest_spatial_map_stamp = time.perf_counter()
+
+    def _store_reference_path(self, poses):
+        with self._lock:
+            self._latest_reference_path = poses
+            self._latest_reference_path_stamp = time.perf_counter()
+
+    def _store_ground_truth_lanes(self, vehicle_pose, lanes):
+        with self._lock:
+            self._latest_ground_truth_vehicle_pose = vehicle_pose
+            self._latest_ground_truth_lanes = lanes
+            self._latest_ground_truth_lane_stamp = time.perf_counter()
 
     def _spin_loop(self):
         while not self._stop_event.is_set() and self.enabled and self.node is not None:
@@ -1556,6 +1672,18 @@ class ROSPerceptionBridge:
                 self._latest_spatial_map_stamp,
                 self._latest_spatial_map_cell_size,
                 list(self._latest_spatial_map_points),
+            )
+
+    def latest_reference_path_snapshot(self):
+        with self._lock:
+            return self._latest_reference_path_stamp, list(self._latest_reference_path)
+
+    def latest_ground_truth_lane_snapshot(self):
+        with self._lock:
+            return (
+                self._latest_ground_truth_lane_stamp,
+                self._latest_ground_truth_vehicle_pose,
+                list(self._latest_ground_truth_lanes),
             )
 
     def close(self):
@@ -2463,6 +2591,22 @@ class AVHMI(pyglet.window.Window):
         self._last_spatial_map_geometry_sync_time = 0.0
         self._spatial_map_visible = False
         self._latest_spatial_map_cell_count = 0
+        self.reference_path_mesh: Optional[Mesh] = None
+        self._last_reference_path_stamp = 0.0
+        self._pending_reference_path_stamp = 0.0
+        self._pending_reference_path: List[Tuple[float, ...]] = []
+        self._last_reference_path_geometry_sync_time = 0.0
+        self._reference_path_visible = False
+        self._latest_reference_path_count = 0
+        self._reference_path_anchor_model: Optional[List[float]] = None
+        self.ground_truth_lane_mesh: Optional[Mesh] = None
+        self._last_ground_truth_lane_stamp = 0.0
+        self._pending_ground_truth_lane_stamp = 0.0
+        self._pending_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
+        self._pending_ground_truth_lanes: List[Dict[str, object]] = []
+        self._last_ground_truth_lane_geometry_sync_time = 0.0
+        self._ground_truth_lane_visible = False
+        self._latest_ground_truth_lane_count = 0
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -3201,6 +3345,134 @@ class AVHMI(pyglet.window.Window):
         self._spatial_map_visible = True
         self._latest_spatial_map_cell_count = len(verts) // 6
 
+    def _sync_reference_path(self, poses: List[Tuple[float, ...]]):
+        enu_poses = []
+        for pose in poses:
+            if len(pose) < 2:
+                continue
+            east = float(pose[0])
+            north = float(pose[1])
+            if not (math.isfinite(east) and math.isfinite(north)):
+                continue
+            if abs(east) >= 9000.0 or abs(north) >= 9000.0:
+                continue
+            yaw = float(pose[3]) if len(pose) >= 4 else float("nan")
+            enu_poses.append((east, north, yaw))
+
+        if not enu_poses:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = 0
+            return
+
+        origin_east, origin_north, origin_yaw = enu_poses[0]
+        if not math.isfinite(origin_yaw) and len(enu_poses) >= 2:
+            next_east, next_north, _next_yaw = enu_poses[1]
+            origin_yaw = math.atan2(next_north - origin_north, next_east - origin_east)
+        if not math.isfinite(origin_yaw):
+            origin_yaw = 0.0
+
+        if self._reference_path_anchor_model is None:
+            car_T = mat4_translate(*self.ego.pos)
+            car_R = mat4_rotate_y(self.ego.yaw)
+            self._reference_path_anchor_model = mat4_mul(car_T, car_R)
+
+        forward_east = math.cos(origin_yaw)
+        forward_north = math.sin(origin_yaw)
+        right_east = math.sin(origin_yaw)
+        right_north = -math.cos(origin_yaw)
+
+        path_points = []
+        for east, north, _yaw in enu_poses:
+            delta_east = east - origin_east
+            delta_north = north - origin_north
+            # Convert from ROS ENU into the car-start frame using the message's
+            # first orientation. ENU yaw is about +Z; the renderer's car-forward
+            # axis is local -Z after anchoring by the captured start transform.
+            local_x = (delta_east * right_east) + (delta_north * right_north)
+            local_forward = (delta_east * forward_east) + (delta_north * forward_north)
+            path_points.append((local_x, REFERENCE_PATH_RENDER_LIFT_M, -local_forward))
+
+        if len(path_points) < 2:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = len(path_points)
+            return
+
+        render_points = smooth_polyline(path_points, passes=1)
+        verts, cols = make_polyline_ribbon(
+            render_points,
+            width=REFERENCE_PATH_WIDTH_M,
+            color=REFERENCE_PATH_COLOR,
+        )
+        if not verts:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = 0
+            return
+
+        if self.reference_path_mesh is None:
+            self.reference_path_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.reference_path_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._reference_path_visible = True
+        self._latest_reference_path_count = len(path_points)
+
+    def _sync_ground_truth_lanes(self, vehicle_pose, lanes: List[Dict[str, object]]):
+        if vehicle_pose is None:
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        origin_east = float(vehicle_pose[0])
+        origin_north = float(vehicle_pose[1])
+        origin_yaw = float(vehicle_pose[3])
+        if not all(math.isfinite(v) for v in (origin_east, origin_north, origin_yaw)):
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        forward_east = math.cos(origin_yaw)
+        forward_north = math.sin(origin_yaw)
+        right_east = math.sin(origin_yaw)
+        right_north = -math.cos(origin_yaw)
+
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+        lane_count = 0
+        for lane in lanes:
+            local_points = []
+            for point in lane.get("points", []):
+                if len(point) < 2:
+                    continue
+                east = float(point[0])
+                north = float(point[1])
+                if not (math.isfinite(east) and math.isfinite(north)):
+                    continue
+                delta_east = east - origin_east
+                delta_north = north - origin_north
+                local_x = (delta_east * right_east) + (delta_north * right_north)
+                local_forward = (delta_east * forward_east) + (delta_north * forward_north)
+                local_points.append((local_x, GROUND_TRUTH_LANE_RENDER_LIFT_M, -local_forward))
+
+            if len(local_points) < 2:
+                continue
+            lane_verts, lane_cols = make_polyline_ribbon(
+                smooth_polyline(local_points, passes=1),
+                width=GROUND_TRUTH_LANE_WIDTH_M,
+                color=GROUND_TRUTH_LANE_COLOR,
+            )
+            verts.extend(lane_verts)
+            cols.extend(lane_cols)
+            lane_count += 1
+
+        if not verts:
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        if self.ground_truth_lane_mesh is None:
+            self.ground_truth_lane_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.ground_truth_lane_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._ground_truth_lane_visible = True
+        self._latest_ground_truth_lane_count = lane_count
+
     def _make_mesh_actor(self, mesh: Mesh):
         return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
 
@@ -3553,6 +3825,10 @@ class AVHMI(pyglet.window.Window):
             spatial_map_stamp, spatial_map_cell_size, spatial_map_points = (
                 self.perception_bridge.latest_spatial_map_snapshot()
             )
+            reference_path_stamp, reference_path = self.perception_bridge.latest_reference_path_snapshot()
+            ground_truth_lane_stamp, ground_truth_vehicle_pose, ground_truth_lanes = (
+                self.perception_bridge.latest_ground_truth_lane_snapshot()
+            )
 
         if detection_stamp > self._last_detection_stamp:
             with self.profiler.section("sync_objects"):
@@ -3619,6 +3895,42 @@ class AVHMI(pyglet.window.Window):
         else:
             self._spatial_map_visible = False
             self._latest_spatial_map_cell_count = 0
+
+        if reference_path_stamp > self._pending_reference_path_stamp:
+            self._pending_reference_path_stamp = reference_path_stamp
+            self._pending_reference_path = reference_path
+        if (
+            self._pending_reference_path_stamp > self._last_reference_path_stamp
+            and now - self._last_reference_path_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_reference_path"):
+                self._sync_reference_path(self._pending_reference_path)
+            self._last_reference_path_stamp = self._pending_reference_path_stamp
+            self._last_reference_path_geometry_sync_time = now
+
+        if self.reference_path_mesh is not None and self._last_reference_path_stamp > 0.0:
+            if time.perf_counter() - self._last_reference_path_stamp > REFERENCE_PATH_FRESHNESS_SEC:
+                self._reference_path_visible = False
+
+        if ground_truth_lane_stamp > self._pending_ground_truth_lane_stamp:
+            self._pending_ground_truth_lane_stamp = ground_truth_lane_stamp
+            self._pending_ground_truth_vehicle_pose = ground_truth_vehicle_pose
+            self._pending_ground_truth_lanes = ground_truth_lanes
+        if (
+            self._pending_ground_truth_lane_stamp > self._last_ground_truth_lane_stamp
+            and now - self._last_ground_truth_lane_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_gt_lanes"):
+                self._sync_ground_truth_lanes(
+                    self._pending_ground_truth_vehicle_pose,
+                    self._pending_ground_truth_lanes,
+                )
+            self._last_ground_truth_lane_stamp = self._pending_ground_truth_lane_stamp
+            self._last_ground_truth_lane_geometry_sync_time = now
+
+        if self.ground_truth_lane_mesh is not None and self._last_ground_truth_lane_stamp > 0.0:
+            if time.perf_counter() - self._last_ground_truth_lane_stamp > GROUND_TRUTH_LANE_FRESHNESS_SEC:
+                self._ground_truth_lane_visible = False
 
         with self.profiler.section("simulation"):
             throttle  = 1.0 if self.keys[key.W] else 0.0
@@ -3691,6 +4003,18 @@ class AVHMI(pyglet.window.Window):
             self.spatial_map_mesh.model = car_M
             self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
 
+        if self.reference_path_mesh is not None and self._reference_path_visible:
+            self.reference_path_mesh.model = self._reference_path_anchor_model or mat4_identity()
+            self.renderer.draw_mesh(self.reference_path_mesh, pv)
+
+        if self.ground_truth_lane_mesh is not None and self._ground_truth_lane_visible:
+            self.ground_truth_lane_mesh.model = car_M
+            self._draw_translucent_mesh(
+                self.ground_truth_lane_mesh,
+                pv,
+                alpha=GROUND_TRUTH_LANE_RENDER_ALPHA,
+            )
+
         for ln in self.lane_meshes:
             ln.model = car_M
             self.renderer.draw_mesh(ln, pv)
@@ -3762,6 +4086,8 @@ class AVHMI(pyglet.window.Window):
                     f"{ros_status}   "
                     f"Objects {len(self.detected_entities)}   "
                     f"Lanes {self._latest_lane_count}   "
+                    f"GT {self._latest_ground_truth_lane_count}   "
+                    f"Path {self._latest_reference_path_count}   "
                     f"{stopbar_status}   "
                     f"{som_status}"
                 )
