@@ -19,6 +19,10 @@ try:
         from visualization_msgs.msg import MarkerArray
     except ImportError:
         MarkerArray = None
+    try:
+        from wauto_localization_msgs.msg import GPSVelocity
+    except ImportError:
+        GPSVelocity = None
     ROS2_AVAILABLE = True
 except ImportError:
     rclpy = None
@@ -30,6 +34,7 @@ except ImportError:
     PolygonStamped = None
     NavPath = None
     MarkerArray = None
+    GPSVelocity = None
     ROS2_AVAILABLE = False
 
 
@@ -86,7 +91,11 @@ REFERENCE_PATH_RENDER_LIFT_M = 0.09
 REFERENCE_PATH_WIDTH_M = 0.24
 REFERENCE_PATH_COLOR = (0.0, 0.92, 1.0)
 REFERENCE_PATH_FRESHNESS_SEC = 2.0
+REFERENCE_PATH_TRAIL_MAX = 8
+REFERENCE_PATH_TRAIL_INTERVAL_SEC = 0.35
+REFERENCE_PATH_TRAIL_ALPHA = 0.24
 GROUND_TRUTH_LANE_TOPIC = "/y5_mid_planner/debug/restrictions"
+GPS_VELOCITY_TOPIC = "/wauto_localization_msgs/gps/GPSVelocity"
 GROUND_TRUTH_LANE_RENDER_LIFT_M = 0.065
 GROUND_TRUTH_LANE_WIDTH_M = 0.15
 GROUND_TRUTH_LANE_COLOR = (0.0, 1.0, 0.30)
@@ -100,6 +109,7 @@ LANE_ORIENTATION_MIN_SEGMENT_M = 0.35
 LANE_ORIENTATION_CELL_SIZE_M = 6.0
 ORIENTATION_UPDATE_INTERVAL_FRAMES = 3
 GROUND_SPEED_FRESHNESS_SEC = 0.45
+GPS_VELOCITY_FRESHNESS_SEC = 0.75
 
 
 def asset_path(*parts: str) -> str:
@@ -1274,6 +1284,7 @@ class PerceptionSubscriber(Node):
         on_spatial_map,
         on_reference_path,
         on_ground_truth_lanes,
+        on_gps_velocity,
         object_topic="/perception/objectdetection",
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
@@ -1281,6 +1292,7 @@ class PerceptionSubscriber(Node):
         spatial_map_topic="/perception/spatial_map",
         reference_path_topic=REFERENCE_PATH_TOPIC,
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
+        gps_velocity_topic=GPS_VELOCITY_TOPIC,
     ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
@@ -1290,6 +1302,7 @@ class PerceptionSubscriber(Node):
         self._on_spatial_map = on_spatial_map
         self._on_reference_path = on_reference_path
         self._on_ground_truth_lanes = on_ground_truth_lanes
+        self._on_gps_velocity = on_gps_velocity
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -1336,6 +1349,14 @@ class PerceptionSubscriber(Node):
                 MarkerArray,
                 ground_truth_lane_topic,
                 self._ground_truth_lane_callback,
+                10,
+            )
+        self.gps_velocity_subscription = None
+        if GPSVelocity is not None:
+            self.gps_velocity_subscription = self.create_subscription(
+                GPSVelocity,
+                gps_velocity_topic,
+                self._gps_velocity_callback,
                 10,
             )
 
@@ -1428,6 +1449,16 @@ class PerceptionSubscriber(Node):
                     "points": points,
                 })
         self._on_ground_truth_lanes(vehicle_pose, lanes)
+
+    def _gps_velocity_callback(self, msg):
+        self._on_gps_velocity({
+            "time_tag": float(msg.time_tag),
+            "latency": float(msg.latency),
+            "diff_age": float(msg.diff_age),
+            "hor_speed": float(msg.hor_speed),
+            "ver_speed": float(msg.ver_speed),
+            "trk_gnd": float(msg.trk_gnd),
+        })
 
 
 class ROSObjectDetectionBridge:
@@ -1539,6 +1570,7 @@ class ROSPerceptionBridge:
         spatial_map_topic="/perception/spatial_map",
         reference_path_topic=REFERENCE_PATH_TOPIC,
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
+        gps_velocity_topic=GPS_VELOCITY_TOPIC,
     ):
         self.enabled = False
         self.node = None
@@ -1552,6 +1584,7 @@ class ROSPerceptionBridge:
         self._latest_spatial_map_stamp = 0.0
         self._latest_reference_path_stamp = 0.0
         self._latest_ground_truth_lane_stamp = 0.0
+        self._latest_gps_velocity_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
         self._latest_stopbar_depth: Optional[float] = None
@@ -1561,6 +1594,7 @@ class ROSPerceptionBridge:
         self._latest_reference_path: List[Tuple[float, ...]] = []
         self._latest_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
         self._latest_ground_truth_lanes: List[Dict[str, object]] = []
+        self._latest_gps_velocity: Optional[Dict[str, float]] = None
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1577,6 +1611,7 @@ class ROSPerceptionBridge:
                 self._store_spatial_map,
                 self._store_reference_path,
                 self._store_ground_truth_lanes,
+                self._store_gps_velocity,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
                 stopbar_topic=stopbar_topic,
@@ -1584,6 +1619,7 @@ class ROSPerceptionBridge:
                 spatial_map_topic=spatial_map_topic,
                 reference_path_topic=reference_path_topic,
                 ground_truth_lane_topic=ground_truth_lane_topic,
+                gps_velocity_topic=gps_velocity_topic,
             )
             self.enabled = True
             self._spin_thread = threading.Thread(
@@ -1592,10 +1628,11 @@ class ROSPerceptionBridge:
                 daemon=True,
             )
             self._spin_thread.start()
+            gps_topic_status = gps_velocity_topic if GPSVelocity is not None else f"{gps_velocity_topic} (message type unavailable)"
             print(
                 f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
                 f"'{stopbar_topic}', '{driveable_polygon_topic}', '{spatial_map_topic}', "
-                f"'{reference_path_topic}', and '{ground_truth_lane_topic}'"
+                f"'{reference_path_topic}', '{ground_truth_lane_topic}', and '{gps_topic_status}'"
             )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
@@ -1637,6 +1674,11 @@ class ROSPerceptionBridge:
             self._latest_ground_truth_vehicle_pose = vehicle_pose
             self._latest_ground_truth_lanes = lanes
             self._latest_ground_truth_lane_stamp = time.perf_counter()
+
+    def _store_gps_velocity(self, velocity):
+        with self._lock:
+            self._latest_gps_velocity = velocity
+            self._latest_gps_velocity_stamp = time.perf_counter()
 
     def _spin_loop(self):
         while not self._stop_event.is_set() and self.enabled and self.node is not None:
@@ -1685,6 +1727,11 @@ class ROSPerceptionBridge:
                 self._latest_ground_truth_vehicle_pose,
                 list(self._latest_ground_truth_lanes),
             )
+
+    def latest_gps_velocity_snapshot(self):
+        with self._lock:
+            velocity = dict(self._latest_gps_velocity) if self._latest_gps_velocity is not None else None
+            return self._latest_gps_velocity_stamp, velocity
 
     def close(self):
         self._stop_event.set()
@@ -2599,6 +2646,8 @@ class AVHMI(pyglet.window.Window):
         self._reference_path_visible = False
         self._latest_reference_path_count = 0
         self._reference_path_anchor_model: Optional[List[float]] = None
+        self._reference_path_trail_meshes: List[Mesh] = []
+        self._last_reference_path_trail_time = 0.0
         self.ground_truth_lane_mesh: Optional[Mesh] = None
         self._last_ground_truth_lane_stamp = 0.0
         self._pending_ground_truth_lane_stamp = 0.0
@@ -2607,6 +2656,10 @@ class AVHMI(pyglet.window.Window):
         self._last_ground_truth_lane_geometry_sync_time = 0.0
         self._ground_truth_lane_visible = False
         self._latest_ground_truth_lane_count = 0
+        self._last_gps_velocity_stamp = 0.0
+        self._gps_speed_mps = 0.0
+        self._gps_track_rad: Optional[float] = None
+        self._gps_world_velocity_mps = [0.0, 0.0, 0.0]
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -3371,10 +3424,9 @@ class AVHMI(pyglet.window.Window):
         if not math.isfinite(origin_yaw):
             origin_yaw = 0.0
 
-        if self._reference_path_anchor_model is None:
-            car_T = mat4_translate(*self.ego.pos)
-            car_R = mat4_rotate_y(self.ego.yaw)
-            self._reference_path_anchor_model = mat4_mul(car_T, car_R)
+        car_T = mat4_translate(*self.ego.pos)
+        car_R = mat4_rotate_y(self.ego.yaw)
+        next_anchor_model = mat4_mul(car_T, car_R)
 
         forward_east = math.cos(origin_yaw)
         forward_north = math.sin(origin_yaw)
@@ -3410,9 +3462,36 @@ class AVHMI(pyglet.window.Window):
 
         if self.reference_path_mesh is None:
             self.reference_path_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self._snapshot_reference_path_trail()
+        self._reference_path_anchor_model = next_anchor_model
         self.renderer.update_color_mesh(self.reference_path_mesh, verts, cols, gl.GL_TRIANGLES)
         self._reference_path_visible = True
         self._latest_reference_path_count = len(path_points)
+
+    def _snapshot_reference_path_trail(self):
+        if self.reference_path_mesh is None or not self._reference_path_visible:
+            return
+        if not self.reference_path_mesh.verts or not self.reference_path_mesh.cols:
+            return
+        if self._reference_path_anchor_model is None:
+            return
+
+        now = time.perf_counter()
+        if now - self._last_reference_path_trail_time < REFERENCE_PATH_TRAIL_INTERVAL_SEC:
+            return
+
+        trail_mesh = Mesh(
+            list(self.reference_path_mesh.verts),
+            list(self.reference_path_mesh.cols),
+            None,
+            None,
+            gl.GL_TRIANGLES,
+            list(self._reference_path_anchor_model),
+        )
+        self._reference_path_trail_meshes.append(trail_mesh)
+        if len(self._reference_path_trail_meshes) > REFERENCE_PATH_TRAIL_MAX:
+            self._reference_path_trail_meshes = self._reference_path_trail_meshes[-REFERENCE_PATH_TRAIL_MAX:]
+        self._last_reference_path_trail_time = now
 
     def _sync_ground_truth_lanes(self, vehicle_pose, lanes: List[Dict[str, object]]):
         if vehicle_pose is None:
@@ -3686,6 +3765,11 @@ class AVHMI(pyglet.window.Window):
             entity.apply_lane_consensus_yaw(consensus_yaw)
 
     def _estimate_ego_motion_local(self, detections: List[Dict[str, float]], detection_dt: Optional[float], ego_delta_yaw: float):
+        gps_motion = self._gps_ego_motion_local(detection_dt)
+        if gps_motion is not None:
+            self._ego_motion_local_estimate = list(gps_motion)
+            return list(self._ego_motion_local_estimate)
+
         motion_samples_x = []
         motion_samples_z = []
 
@@ -3800,7 +3884,62 @@ class AVHMI(pyglet.window.Window):
             gl.glDepthMask(gl.GL_TRUE)
             gl.glDisable(gl.GL_BLEND)
 
+    def _gps_velocity_is_fresh(self, now: Optional[float] = None):
+        if self._last_gps_velocity_stamp <= 0.0:
+            return False
+        if now is None:
+            now = time.perf_counter()
+        return now - self._last_gps_velocity_stamp <= GPS_VELOCITY_FRESHNESS_SEC
+
+    def _sync_gps_velocity(self, velocity: Optional[Dict[str, float]]):
+        if velocity is None:
+            return
+
+        speed = float(velocity.get("hor_speed", 0.0))
+        track_deg = float(velocity.get("trk_gnd", float("nan")))
+        if not math.isfinite(speed):
+            return
+        speed = max(0.0, abs(speed))
+
+        track_rad = math.radians(track_deg % 360.0) if math.isfinite(track_deg) else None
+        self._gps_speed_mps = speed
+        self._gps_track_rad = track_rad
+        self._gps_world_velocity_mps = [
+            speed * math.sin(self.ego.yaw),
+            0.0,
+            -speed * math.cos(self.ego.yaw),
+        ]
+        self._ego_speed_mps_estimate = speed
+        self._ego_forward_speed_mps_estimate = speed
+        self._ego_speed_mph_history.append(speed * MPS_TO_MPH)
+        if len(self._ego_speed_mph_history) > SPEED_ROLLING_WINDOW:
+            self._ego_speed_mph_history.pop(0)
+
+    def _gps_ego_motion_local(self, dt: Optional[float]):
+        if dt is None or not math.isfinite(dt) or dt <= 0.0:
+            return None
+        if not self._gps_velocity_is_fresh():
+            return None
+
+        return [0.0, 0.0, -self._gps_speed_mps * dt]
+
+    def _apply_gps_ego_motion(self, dt: float):
+        if dt <= 0.0:
+            return
+
+        self.ego.v = self._gps_speed_mps
+        self._gps_world_velocity_mps = [
+            self._gps_speed_mps * math.sin(self.ego.yaw),
+            0.0,
+            -self._gps_speed_mps * math.cos(self.ego.yaw),
+        ]
+        self.ego.pos[0] += self._gps_world_velocity_mps[0] * dt
+        self.ego.pos[2] += self._gps_world_velocity_mps[2] * dt
+        self.ego.mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
+
     def _current_ground_speed_mps(self):
+        if self._gps_velocity_is_fresh():
+            return self._gps_speed_mps
         if self._last_detection_stamp > 0.0:
             age = time.perf_counter() - self._last_detection_stamp
             if age <= GROUND_SPEED_FRESHNESS_SEC:
@@ -3829,6 +3968,11 @@ class AVHMI(pyglet.window.Window):
             ground_truth_lane_stamp, ground_truth_vehicle_pose, ground_truth_lanes = (
                 self.perception_bridge.latest_ground_truth_lane_snapshot()
             )
+            gps_velocity_stamp, gps_velocity = self.perception_bridge.latest_gps_velocity_snapshot()
+
+        if gps_velocity_stamp > self._last_gps_velocity_stamp:
+            self._sync_gps_velocity(gps_velocity)
+            self._last_gps_velocity_stamp = gps_velocity_stamp
 
         if detection_stamp > self._last_detection_stamp:
             with self.profiler.section("sync_objects"):
@@ -3938,7 +4082,10 @@ class AVHMI(pyglet.window.Window):
             steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
             self.brake_on = brake > 0.1
 
-            self.ego.update(dt, throttle, steer_cmd, brake)
+            if self._gps_velocity_is_fresh(now):
+                self._apply_gps_ego_motion(dt)
+            else:
+                self.ego.update(dt, throttle, steer_cmd, brake)
             ground_speed_mps = self._current_ground_speed_mps()
             for w in self.wheels:
                 r = max(1e-6, w['radius'])
@@ -4002,6 +4149,14 @@ class AVHMI(pyglet.window.Window):
         if self.show_spatial_map and self.spatial_map_mesh is not None and self._spatial_map_visible:
             self.spatial_map_mesh.model = car_M
             self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
+
+        for idx, trail_mesh in enumerate(self._reference_path_trail_meshes):
+            fade = (idx + 1) / max(1, len(self._reference_path_trail_meshes))
+            self._draw_translucent_mesh(
+                trail_mesh,
+                pv,
+                alpha=REFERENCE_PATH_TRAIL_ALPHA * fade,
+            )
 
         if self.reference_path_mesh is not None and self._reference_path_visible:
             self.reference_path_mesh.model = self._reference_path_anchor_model or mat4_identity()
@@ -4080,9 +4235,15 @@ class AVHMI(pyglet.window.Window):
                     if self._spatial_map_visible
                     else "SOM --"
                 )
+                gps_status = (
+                    f"GPS {self._gps_speed_mps:4.1f} m/s"
+                    if self._gps_velocity_is_fresh()
+                    else "GPS --"
+                )
                 self.hud.text = (
                     f"Sim Speed {self.ego.v:4.1f} m/s   "
                     f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
+                    f"{gps_status}   "
                     f"{ros_status}   "
                     f"Objects {len(self.detected_entities)}   "
                     f"Lanes {self._latest_lane_count}   "
