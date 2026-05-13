@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import pyglet
-from pyglet.window import key, mouse
+from pyglet.window import key
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
@@ -23,6 +23,10 @@ try:
         from wauto_localization_msgs.msg import GPSVelocity
     except ImportError:
         GPSVelocity = None
+    try:
+        from wauto_localization_msgs.msg import GPSHeading
+    except ImportError:
+        GPSHeading = None
     ROS2_AVAILABLE = True
 except ImportError:
     rclpy = None
@@ -35,13 +39,14 @@ except ImportError:
     NavPath = None
     MarkerArray = None
     GPSVelocity = None
+    GPSHeading = None
     ROS2_AVAILABLE = False
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
 DETECTION_YAW_CORRECTION_DEG = 0.0
-DETECTION_LATERAL_OFFSET_M = -1.0
+DETECTION_LATERAL_OFFSET_M = 0.0
 DETECTION_YAW_CORRECTION_RAD = math.radians(DETECTION_YAW_CORRECTION_DEG)
 LANE_CONSENSUS_CLASSES = {1, 11, 13}
 VEHICLE_AXIS_MIN_STEP_M = 0.12
@@ -96,6 +101,7 @@ REFERENCE_PATH_TRAIL_INTERVAL_SEC = 0.35
 REFERENCE_PATH_TRAIL_ALPHA = 0.24
 GROUND_TRUTH_LANE_TOPIC = "/y5_mid_planner/debug/restrictions"
 GPS_VELOCITY_TOPIC = "/wauto_localization_msgs/gps/GPSVelocity"
+GPS_HEADING_TOPIC = "/wauto_localization_msgs/gps/GPSHeading"
 GROUND_TRUTH_LANE_RENDER_LIFT_M = 0.065
 GROUND_TRUTH_LANE_WIDTH_M = 0.15
 GROUND_TRUTH_LANE_COLOR = (0.0, 1.0, 0.30)
@@ -110,6 +116,7 @@ LANE_ORIENTATION_CELL_SIZE_M = 6.0
 ORIENTATION_UPDATE_INTERVAL_FRAMES = 3
 GROUND_SPEED_FRESHNESS_SEC = 0.45
 GPS_VELOCITY_FRESHNESS_SEC = 0.75
+GPS_HEADING_FRESHNESS_SEC = 1.0
 
 
 def asset_path(*parts: str) -> str:
@@ -1285,6 +1292,7 @@ class PerceptionSubscriber(Node):
         on_reference_path,
         on_ground_truth_lanes,
         on_gps_velocity,
+        on_gps_heading,
         object_topic="/perception/objectdetection",
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
@@ -1293,6 +1301,7 @@ class PerceptionSubscriber(Node):
         reference_path_topic=REFERENCE_PATH_TOPIC,
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
         gps_velocity_topic=GPS_VELOCITY_TOPIC,
+        gps_heading_topic=GPS_HEADING_TOPIC,
     ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
@@ -1303,6 +1312,7 @@ class PerceptionSubscriber(Node):
         self._on_reference_path = on_reference_path
         self._on_ground_truth_lanes = on_ground_truth_lanes
         self._on_gps_velocity = on_gps_velocity
+        self._on_gps_heading = on_gps_heading
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -1357,6 +1367,14 @@ class PerceptionSubscriber(Node):
                 GPSVelocity,
                 gps_velocity_topic,
                 self._gps_velocity_callback,
+                10,
+            )
+        self.gps_heading_subscription = None
+        if GPSHeading is not None:
+            self.gps_heading_subscription = self.create_subscription(
+                GPSHeading,
+                gps_heading_topic,
+                self._gps_heading_callback,
                 10,
             )
 
@@ -1458,6 +1476,16 @@ class PerceptionSubscriber(Node):
             "hor_speed": float(msg.hor_speed),
             "ver_speed": float(msg.ver_speed),
             "trk_gnd": float(msg.trk_gnd),
+        })
+
+    def _gps_heading_callback(self, msg):
+        self._on_gps_heading({
+            "available": bool(msg.available),
+            "heading": float(msg.heading),
+            "pitch": float(msg.pitch),
+            "heading_stdev": float(msg.heading_stdev),
+            "pitch_stdev": float(msg.pitch_stdev),
+            "azimuth": float(msg.azimuth),
         })
 
 
@@ -1571,6 +1599,7 @@ class ROSPerceptionBridge:
         reference_path_topic=REFERENCE_PATH_TOPIC,
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
         gps_velocity_topic=GPS_VELOCITY_TOPIC,
+        gps_heading_topic=GPS_HEADING_TOPIC,
     ):
         self.enabled = False
         self.node = None
@@ -1585,6 +1614,7 @@ class ROSPerceptionBridge:
         self._latest_reference_path_stamp = 0.0
         self._latest_ground_truth_lane_stamp = 0.0
         self._latest_gps_velocity_stamp = 0.0
+        self._latest_gps_heading_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
         self._latest_stopbar_depth: Optional[float] = None
@@ -1595,6 +1625,7 @@ class ROSPerceptionBridge:
         self._latest_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
         self._latest_ground_truth_lanes: List[Dict[str, object]] = []
         self._latest_gps_velocity: Optional[Dict[str, float]] = None
+        self._latest_gps_heading: Optional[Dict[str, float]] = None
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1612,6 +1643,7 @@ class ROSPerceptionBridge:
                 self._store_reference_path,
                 self._store_ground_truth_lanes,
                 self._store_gps_velocity,
+                self._store_gps_heading,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
                 stopbar_topic=stopbar_topic,
@@ -1620,6 +1652,7 @@ class ROSPerceptionBridge:
                 reference_path_topic=reference_path_topic,
                 ground_truth_lane_topic=ground_truth_lane_topic,
                 gps_velocity_topic=gps_velocity_topic,
+                gps_heading_topic=gps_heading_topic,
             )
             self.enabled = True
             self._spin_thread = threading.Thread(
@@ -1628,11 +1661,13 @@ class ROSPerceptionBridge:
                 daemon=True,
             )
             self._spin_thread.start()
-            gps_topic_status = gps_velocity_topic if GPSVelocity is not None else f"{gps_velocity_topic} (message type unavailable)"
+            gps_velocity_status = gps_velocity_topic if GPSVelocity is not None else f"{gps_velocity_topic} (message type unavailable)"
+            gps_heading_status = gps_heading_topic if GPSHeading is not None else f"{gps_heading_topic} (message type unavailable)"
             print(
                 f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
                 f"'{stopbar_topic}', '{driveable_polygon_topic}', '{spatial_map_topic}', "
-                f"'{reference_path_topic}', '{ground_truth_lane_topic}', and '{gps_topic_status}'"
+                f"'{reference_path_topic}', '{ground_truth_lane_topic}', "
+                f"'{gps_velocity_status}', and '{gps_heading_status}'"
             )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
@@ -1679,6 +1714,11 @@ class ROSPerceptionBridge:
         with self._lock:
             self._latest_gps_velocity = velocity
             self._latest_gps_velocity_stamp = time.perf_counter()
+
+    def _store_gps_heading(self, heading):
+        with self._lock:
+            self._latest_gps_heading = heading
+            self._latest_gps_heading_stamp = time.perf_counter()
 
     def _spin_loop(self):
         while not self._stop_event.is_set() and self.enabled and self.node is not None:
@@ -1732,6 +1772,11 @@ class ROSPerceptionBridge:
         with self._lock:
             velocity = dict(self._latest_gps_velocity) if self._latest_gps_velocity is not None else None
             return self._latest_gps_velocity_stamp, velocity
+
+    def latest_gps_heading_snapshot(self):
+        with self._lock:
+            heading = dict(self._latest_gps_heading) if self._latest_gps_heading is not None else None
+            return self._latest_gps_heading_stamp, heading
 
     def close(self):
         self._stop_event.set()
@@ -2584,8 +2629,6 @@ class AVHMI(pyglet.window.Window):
 
         self.keys = key.KeyStateHandler()
         self.push_handlers(self.keys)
-        self.set_exclusive_mouse(False)
-        self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
         self.coord_label = pyglet.text.Label(
             "",
@@ -2604,7 +2647,7 @@ class AVHMI(pyglet.window.Window):
         )
         geometry_hz = read_float_env("WAUTOVANTAGE_PERCEPTION_GEOMETRY_MAX_HZ", 20.0, minimum=1.0)
         self._perception_geometry_min_interval = 1.0 / geometry_hz
-        self.camera_origin_local = (0.0, 1.35, 0.0)
+        self.camera_origin_local = (0.0, 0.0, 0.0)
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
         self._last_detection_stamp = 0.0
@@ -2657,8 +2700,10 @@ class AVHMI(pyglet.window.Window):
         self._ground_truth_lane_visible = False
         self._latest_ground_truth_lane_count = 0
         self._last_gps_velocity_stamp = 0.0
+        self._last_gps_heading_stamp = 0.0
         self._gps_speed_mps = 0.0
         self._gps_track_rad: Optional[float] = None
+        self._gps_heading_rad: Optional[float] = None
         self._gps_world_velocity_mps = [0.0, 0.0, 0.0]
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
@@ -3026,11 +3071,11 @@ class AVHMI(pyglet.window.Window):
         self._grid_center_tile = None
         self.lane_meshes = [Mesh(*make_polyline(pts), None, None, gl.GL_LINES, mat4_identity()) for pts in lane_pts]
 
-        # Camera (initialize behind the car)
-        self.cam_yawoff = math.pi / 2.0
-        self.cam_pitch  = math.radians(48.0)
-        self.cam_dist   = 6.5
-        self.cam_height = 2.5
+        # Third-person chase camera, locked behind the ego vehicle.
+        self.chase_cam_dist = 8.5
+        self.chase_cam_height = 3.2
+        self.chase_cam_target_height = 1.25
+        self.chase_cam_lookahead = 7.0
 
         self.renderer = Renderer()
         self._stream_grid()
@@ -3813,22 +3858,6 @@ class AVHMI(pyglet.window.Window):
 
         return list(self._ego_motion_local_estimate)
 
-    # Input
-    def on_mouse_press(self, x, y, button, modifiers):
-        if button == mouse.LEFT:
-            self.mouse_captured = not self.mouse_captured
-            self.set_exclusive_mouse(self.mouse_captured)
-
-    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
-        if self.mouse_captured:
-            self.cam_yawoff -= dx * 0.0022   # inverted yaw
-            self.cam_pitch   = clamp(self.cam_pitch - dy*0.0022, math.radians(-5), math.radians(80))
-
-    def on_mouse_motion(self, x, y, dx, dy):
-        if self.mouse_captured:
-            self.cam_yawoff -= dx * 0.0022
-            self.cam_pitch   = clamp(self.cam_pitch - dy*0.0022, math.radians(-5), math.radians(80))
-
     def on_resize(self, width, height):
         self._projection_dirty = True
         return super().on_resize(width, height)
@@ -3891,6 +3920,20 @@ class AVHMI(pyglet.window.Window):
             now = time.perf_counter()
         return now - self._last_gps_velocity_stamp <= GPS_VELOCITY_FRESHNESS_SEC
 
+    def _gps_heading_is_fresh(self, now: Optional[float] = None):
+        if self._last_gps_heading_stamp <= 0.0 or self._gps_heading_rad is None:
+            return False
+        if now is None:
+            now = time.perf_counter()
+        return now - self._last_gps_heading_stamp <= GPS_HEADING_FRESHNESS_SEC
+
+    def _gps_motion_yaw(self, now: Optional[float] = None):
+        if self._gps_heading_is_fresh(now):
+            return self._gps_heading_rad
+        if self._gps_track_rad is not None:
+            return self._gps_track_rad
+        return self.ego.yaw
+
     def _sync_gps_velocity(self, velocity: Optional[Dict[str, float]]):
         if velocity is None:
             return
@@ -3904,16 +3947,29 @@ class AVHMI(pyglet.window.Window):
         track_rad = math.radians(track_deg % 360.0) if math.isfinite(track_deg) else None
         self._gps_speed_mps = speed
         self._gps_track_rad = track_rad
+        motion_yaw = self._gps_motion_yaw()
         self._gps_world_velocity_mps = [
-            speed * math.sin(self.ego.yaw),
+            speed * math.sin(motion_yaw),
             0.0,
-            -speed * math.cos(self.ego.yaw),
+            -speed * math.cos(motion_yaw),
         ]
         self._ego_speed_mps_estimate = speed
         self._ego_forward_speed_mps_estimate = speed
         self._ego_speed_mph_history.append(speed * MPS_TO_MPH)
         if len(self._ego_speed_mph_history) > SPEED_ROLLING_WINDOW:
             self._ego_speed_mph_history.pop(0)
+
+    def _sync_gps_heading(self, heading: Optional[Dict[str, float]]):
+        if heading is None or not bool(heading.get("available", False)):
+            self._gps_heading_rad = None
+            return
+
+        azimuth = float(heading.get("azimuth", float("nan")))
+        if not math.isfinite(azimuth):
+            self._gps_heading_rad = None
+            return
+
+        self._gps_heading_rad = math.radians(azimuth % 360.0)
 
     def _gps_ego_motion_local(self, dt: Optional[float]):
         if dt is None or not math.isfinite(dt) or dt <= 0.0:
@@ -3928,6 +3984,8 @@ class AVHMI(pyglet.window.Window):
             return
 
         self.ego.v = self._gps_speed_mps
+        motion_yaw = self._gps_motion_yaw()
+        self.ego.yaw = lerp_angle(self.ego.yaw, motion_yaw, clamp(dt * 8.0, 0.0, 1.0))
         self._gps_world_velocity_mps = [
             self._gps_speed_mps * math.sin(self.ego.yaw),
             0.0,
@@ -3969,6 +4027,11 @@ class AVHMI(pyglet.window.Window):
                 self.perception_bridge.latest_ground_truth_lane_snapshot()
             )
             gps_velocity_stamp, gps_velocity = self.perception_bridge.latest_gps_velocity_snapshot()
+            gps_heading_stamp, gps_heading = self.perception_bridge.latest_gps_heading_snapshot()
+
+        if gps_heading_stamp > self._last_gps_heading_stamp:
+            self._sync_gps_heading(gps_heading)
+            self._last_gps_heading_stamp = gps_heading_stamp
 
         if gps_velocity_stamp > self._last_gps_velocity_stamp:
             self._sync_gps_velocity(gps_velocity)
@@ -4115,22 +4178,14 @@ class AVHMI(pyglet.window.Window):
 
         proj = self._projection()
 
-        # Camera mount point
-        cam_mount_local_x, cam_mount_local_y, cam_mount_local_z = self.camera_origin_local
-        
-        # Transform camera mount to world space based on vehicle rotation
-        c = math.cos(self.ego.yaw)
-        s = math.sin(self.ego.yaw)
-        cam_mount_world_x = self.ego.pos[0] + (c * cam_mount_local_x - s * cam_mount_local_z)
-        cam_mount_world_y = self.ego.pos[1] + cam_mount_local_y
-        cam_mount_world_z = self.ego.pos[2] + (s * cam_mount_local_x + c * cam_mount_local_z)
-        
-        # Camera orbits around the windshield mount point
-        tx, ty, tz = cam_mount_world_x, cam_mount_world_y, cam_mount_world_z
-        yaw = self.cam_yawoff
-        cx = tx - math.cos(yaw) * self.cam_dist
-        cy = ty + self.cam_height * math.sin(self.cam_pitch)
-        cz = tz + math.sin(yaw) * self.cam_dist
+        forward_x = math.sin(self.ego.yaw)
+        forward_z = -math.cos(self.ego.yaw)
+        tx = self.ego.pos[0] + (forward_x * self.chase_cam_lookahead)
+        ty = self.ego.pos[1] + self.chase_cam_target_height
+        tz = self.ego.pos[2] + (forward_z * self.chase_cam_lookahead)
+        cx = self.ego.pos[0] - (forward_x * self.chase_cam_dist)
+        cy = self.ego.pos[1] + self.chase_cam_height
+        cz = self.ego.pos[2] - (forward_z * self.chase_cam_dist)
         view = look_at((cx, cy, cz), (tx, ty, tz), (0.0, 1.0, 0.0))
         pv = mat4_mul(proj, view)
 
@@ -4240,10 +4295,16 @@ class AVHMI(pyglet.window.Window):
                     if self._gps_velocity_is_fresh()
                     else "GPS --"
                 )
+                heading_status = (
+                    f"Az {math.degrees(self._gps_heading_rad):5.1f} deg"
+                    if self._gps_heading_is_fresh()
+                    else "Az --"
+                )
                 self.hud.text = (
                     f"Sim Speed {self.ego.v:4.1f} m/s   "
                     f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
                     f"{gps_status}   "
+                    f"{heading_status}   "
                     f"{ros_status}   "
                     f"Objects {len(self.detected_entities)}   "
                     f"Lanes {self._latest_lane_count}   "
