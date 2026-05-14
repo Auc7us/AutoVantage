@@ -93,12 +93,10 @@ SPATIAL_MAP_RENDER_ALPHA = 0.55
 SPATIAL_MAP_MAX_RANGE_M = 80.0
 REFERENCE_PATH_TOPIC = "/y5_mid_planner/debug/reference_path"
 REFERENCE_PATH_RENDER_LIFT_M = 0.09
-REFERENCE_PATH_WIDTH_M = 0.24
+REFERENCE_PATH_WIDTH_M = 2.0
 REFERENCE_PATH_COLOR = (0.0, 0.92, 1.0)
+REFERENCE_PATH_EDGE_ALPHA = 0.12
 REFERENCE_PATH_FRESHNESS_SEC = 2.0
-REFERENCE_PATH_TRAIL_MAX = 8
-REFERENCE_PATH_TRAIL_INTERVAL_SEC = 0.35
-REFERENCE_PATH_TRAIL_ALPHA = 0.24
 GROUND_TRUTH_LANE_TOPIC = "/y5_mid_planner/debug/restrictions"
 GPS_VELOCITY_TOPIC = "/wauto_localization_msgs/gps/GPSVelocity"
 GPS_HEADING_TOPIC = "/wauto_localization_msgs/gps/GPSHeading"
@@ -453,9 +451,9 @@ def look_at(eye, center, up):
 VERT_COLOR = """
 #version 330
 layout(location = 0) in vec3 in_pos;
-layout(location = 1) in vec3 in_col;
+layout(location = 1) in vec4 in_col;
 uniform mat4 u_mvp;
-out vec3 v_col;
+out vec4 v_col;
 void main(){
     v_col = in_col;
     gl_Position = u_mvp * vec4(in_pos, 1.0);
@@ -465,13 +463,13 @@ void main(){
 VERT_COLOR_INSTANCED = """
 #version 330
 layout(location = 0) in vec3 in_pos;
-layout(location = 1) in vec3 in_col;
+layout(location = 1) in vec4 in_col;
 layout(location = 2) in vec4 in_model_col0;
 layout(location = 3) in vec4 in_model_col1;
 layout(location = 4) in vec4 in_model_col2;
 layout(location = 5) in vec4 in_model_col3;
 uniform mat4 u_proj_view;
-out vec3 v_col;
+out vec4 v_col;
 void main(){
     v_col = in_col;
     mat4 in_model = mat4(in_model_col0, in_model_col1, in_model_col2, in_model_col3);
@@ -481,11 +479,11 @@ void main(){
 
 FRAG_COLOR = """
 #version 330
-in vec3 v_col;
+in vec4 v_col;
 uniform float u_alpha;
 out vec4 out_col;
 void main(){
-    out_col = vec4(v_col, u_alpha);
+    out_col = vec4(v_col.rgb, v_col.a * u_alpha);
 }
 """
 
@@ -624,7 +622,7 @@ def resample_polyline_for_orientation(points, min_segment_length):
     return sampled
 
 
-def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
+def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2), edge_alpha: Optional[float] = None):
     if len(points) < 2:
         return [], []
 
@@ -655,6 +653,22 @@ def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
 
     verts = []
     cols = []
+    if edge_alpha is not None:
+        edge_color = (color[0], color[1], color[2], clamp(edge_alpha, 0.0, 1.0))
+        center_color = (color[0], color[1], color[2], 1.0)
+        for i in range(len(points) - 1):
+            left_a = left_pts[i]
+            center_a = points[i]
+            right_a = right_pts[i]
+            left_b = left_pts[i + 1]
+            center_b = points[i + 1]
+            right_b = right_pts[i + 1]
+            verts.extend((left_a, center_a, center_b, left_a, center_b, left_b))
+            cols.extend((edge_color, center_color, center_color, edge_color, center_color, edge_color))
+            verts.extend((center_a, right_a, right_b, center_a, right_b, center_b))
+            cols.extend((center_color, edge_color, edge_color, center_color, edge_color, center_color))
+        return verts, cols
+
     for i in range(len(points) - 1):
         a = left_pts[i]
         b = right_pts[i]
@@ -2321,16 +2335,20 @@ class Renderer:
                 x = mesh.verts[i]
                 y = mesh.verts[i + 1]
                 z = mesh.verts[i + 2]
-                r, g, b = mesh.cols[i // 3] if mesh.cols else (1.0, 1.0, 1.0)
-                inter.extend((x, y, z, r, g, b))
+                color = mesh.cols[i // 3] if mesh.cols else (1.0, 1.0, 1.0)
+                r, g, b = color[:3]
+                a = color[3] if len(color) >= 4 else 1.0
+                inter.extend((x, y, z, r, g, b, a))
         else:
             vertex_count = n
             for i in range(n):
                 x, y, z = mesh.verts[i]
-                r, g, b = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
-                inter.extend((x, y, z, r, g, b))
+                color = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
+                r, g, b = color[:3]
+                a = color[3] if len(color) >= 4 else 1.0
+                inter.extend((x, y, z, r, g, b, a))
 
-        arr = (gl.GLfloat * max(1, 6 * vertex_count))(*inter) if vertex_count else None
+        arr = (gl.GLfloat * max(1, 7 * vertex_count))(*inter) if vertex_count else None
         return arr, vertex_count
 
     def _next_capacity(self, needed: int, current: int = 0) -> int:
@@ -2350,7 +2368,7 @@ class Renderer:
         gl.glBindVertexArray(vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
         if capacity > vertex_count:
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, 6 * capacity * ctypes.sizeof(gl.GLfloat), None, usage)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 7 * capacity * ctypes.sizeof(gl.GLfloat), None, usage)
             if arr is not None:
                 gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
         elif arr is not None:
@@ -2358,11 +2376,11 @@ class Renderer:
         else:
             gl.glBufferData(gl.GL_ARRAY_BUFFER, 0, None, usage)
 
-        stride = 6 * ctypes.sizeof(gl.GLfloat)
+        stride = 7 * ctypes.sizeof(gl.GLfloat)
         gl.glEnableVertexAttribArray(0)
         gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(0))
         gl.glEnableVertexAttribArray(1)
-        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
         mesh._gpu_capacity = capacity
@@ -2397,7 +2415,7 @@ class Renderer:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
         if vertex_count > capacity:
             capacity = self._next_capacity(vertex_count, capacity)
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, 6 * capacity * ctypes.sizeof(gl.GLfloat), None, gl.GL_DYNAMIC_DRAW)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 7 * capacity * ctypes.sizeof(gl.GLfloat), None, gl.GL_DYNAMIC_DRAW)
             mesh._gpu_capacity = capacity
         gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
@@ -2689,8 +2707,6 @@ class AVHMI(pyglet.window.Window):
         self._reference_path_visible = False
         self._latest_reference_path_count = 0
         self._reference_path_anchor_model: Optional[List[float]] = None
-        self._reference_path_trail_meshes: List[Mesh] = []
-        self._last_reference_path_trail_time = 0.0
         self.ground_truth_lane_mesh: Optional[Mesh] = None
         self._last_ground_truth_lane_stamp = 0.0
         self._pending_ground_truth_lane_stamp = 0.0
@@ -3499,6 +3515,7 @@ class AVHMI(pyglet.window.Window):
             render_points,
             width=REFERENCE_PATH_WIDTH_M,
             color=REFERENCE_PATH_COLOR,
+            edge_alpha=REFERENCE_PATH_EDGE_ALPHA,
         )
         if not verts:
             self._reference_path_visible = False
@@ -3507,36 +3524,10 @@ class AVHMI(pyglet.window.Window):
 
         if self.reference_path_mesh is None:
             self.reference_path_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
-        self._snapshot_reference_path_trail()
         self._reference_path_anchor_model = next_anchor_model
         self.renderer.update_color_mesh(self.reference_path_mesh, verts, cols, gl.GL_TRIANGLES)
         self._reference_path_visible = True
         self._latest_reference_path_count = len(path_points)
-
-    def _snapshot_reference_path_trail(self):
-        if self.reference_path_mesh is None or not self._reference_path_visible:
-            return
-        if not self.reference_path_mesh.verts or not self.reference_path_mesh.cols:
-            return
-        if self._reference_path_anchor_model is None:
-            return
-
-        now = time.perf_counter()
-        if now - self._last_reference_path_trail_time < REFERENCE_PATH_TRAIL_INTERVAL_SEC:
-            return
-
-        trail_mesh = Mesh(
-            list(self.reference_path_mesh.verts),
-            list(self.reference_path_mesh.cols),
-            None,
-            None,
-            gl.GL_TRIANGLES,
-            list(self._reference_path_anchor_model),
-        )
-        self._reference_path_trail_meshes.append(trail_mesh)
-        if len(self._reference_path_trail_meshes) > REFERENCE_PATH_TRAIL_MAX:
-            self._reference_path_trail_meshes = self._reference_path_trail_meshes[-REFERENCE_PATH_TRAIL_MAX:]
-        self._last_reference_path_trail_time = now
 
     def _sync_ground_truth_lanes(self, vehicle_pose, lanes: List[Dict[str, object]]):
         if vehicle_pose is None:
@@ -4205,17 +4196,9 @@ class AVHMI(pyglet.window.Window):
             self.spatial_map_mesh.model = car_M
             self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
 
-        for idx, trail_mesh in enumerate(self._reference_path_trail_meshes):
-            fade = (idx + 1) / max(1, len(self._reference_path_trail_meshes))
-            self._draw_translucent_mesh(
-                trail_mesh,
-                pv,
-                alpha=REFERENCE_PATH_TRAIL_ALPHA * fade,
-            )
-
         if self.reference_path_mesh is not None and self._reference_path_visible:
             self.reference_path_mesh.model = self._reference_path_anchor_model or mat4_identity()
-            self.renderer.draw_mesh(self.reference_path_mesh, pv)
+            self._draw_translucent_mesh(self.reference_path_mesh, pv, alpha=1.0)
 
         if self.ground_truth_lane_mesh is not None and self._ground_truth_lane_visible:
             self.ground_truth_lane_mesh.model = car_M
