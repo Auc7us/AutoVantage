@@ -1,5 +1,5 @@
 # Pyglet 2.1.9 • Modern OpenGL (core profile) • Textured OBJ support
-import math, time, ctypes, os, threading
+import json, math, time, ctypes, os, threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -15,6 +15,10 @@ try:
     from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth, SpatialMap
     from geometry_msgs.msg import PolygonStamped
     from nav_msgs.msg import Path as NavPath
+    try:
+        from std_msgs.msg import String as RosString
+    except ImportError:
+        RosString = None
     try:
         from visualization_msgs.msg import MarkerArray
     except ImportError:
@@ -37,6 +41,7 @@ except ImportError:
     SpatialMap = None
     PolygonStamped = None
     NavPath = None
+    RosString = None
     MarkerArray = None
     GPSVelocity = None
     GPSHeading = None
@@ -91,6 +96,11 @@ SPATIAL_MAP_FRESHNESS_SEC = 0.8
 SPATIAL_MAP_CELL_COLOR = (0.86, 0.55, 0.55)
 SPATIAL_MAP_RENDER_ALPHA = 0.55
 SPATIAL_MAP_MAX_RANGE_M = 80.0
+YOLO_3D_BBOX_TOPIC = "/perception/hybrid_yolo_detections"
+YOLO_3D_BBOX_RENDER_LIFT_M = 0.035
+YOLO_3D_BBOX_FRESHNESS_SEC = 0.8
+YOLO_3D_BBOX_LINE_WIDTH_PX = 3.0
+YOLO_3D_BBOX_DEFAULT_COLOR = (1.0, 0.82, 0.18)
 REFERENCE_PATH_TOPIC = "/y5_mid_planner/debug/reference_path"
 REFERENCE_PATH_RENDER_LIFT_M = 0.09
 REFERENCE_PATH_WIDTH_M = 2.0
@@ -1242,6 +1252,100 @@ def center_ground_mesh_vertices(verts: List[Tuple[float, float, float]]):
     return [(x - cx, y - ymin, z - cz) for (x, y, z) in verts]
 
 
+def _safe_float(value, default=0.0):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _coerce_point_list(value, width: int):
+    if value is None or width <= 0:
+        return []
+    points = []
+    if isinstance(value, (list, tuple)):
+        if value and all(isinstance(v, (int, float)) for v in value):
+            for idx in range(0, len(value) - width + 1, width):
+                point = tuple(_safe_float(v, float("nan")) for v in value[idx:idx + width])
+                if all(math.isfinite(v) and abs(v) < 9000.0 for v in point):
+                    points.append(point)
+            return points
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) < width:
+                continue
+            point = tuple(_safe_float(v, float("nan")) for v in item[:width])
+            if all(math.isfinite(v) and abs(v) < 9000.0 for v in point):
+                points.append(point)
+    return points
+
+
+def parse_yolo_3d_bbox_payload(payload: str):
+    if not payload:
+        return []
+    text = str(payload).strip()
+    if text.startswith("YOLO_DETECTIONS:"):
+        text = text[len("YOLO_DETECTIONS:"):].strip()
+    try:
+        decoded = json.loads(text)
+    except ValueError as exc:
+        print(f"Invalid YOLO 3D bbox payload: {exc}: {text[:160]}")
+        return []
+
+    if isinstance(decoded, list):
+        raw_objects = decoded
+    elif isinstance(decoded, dict):
+        raw_objects = decoded.get("objects", decoded.get("detections", []))
+    else:
+        raw_objects = []
+
+    boxes = []
+    for idx, obj in enumerate(raw_objects):
+        if not isinstance(obj, dict):
+            continue
+        dims = obj.get("dimensions_m", {})
+        if not isinstance(dims, dict):
+            dims = {}
+        boxes.append({
+            "id": _safe_int(obj.get("id", obj.get("object_id", idx)), idx),
+            "class_id": _safe_int(obj.get("class_id", obj.get("obj_class", 255)), 255),
+            "confidence": _safe_float(obj.get("confidence", 0.0), 0.0),
+            "valid_obb": _safe_bool(obj.get("valid_obb", True), True),
+            "yaw_rad": _safe_float(obj.get("yaw_rad", 0.0), 0.0),
+            "dimensions_m": {
+                "length": _safe_float(dims.get("length", obj.get("length")), 0.0),
+                "width": _safe_float(dims.get("width", obj.get("width")), 0.0),
+                "height": _safe_float(dims.get("height", obj.get("height")), 0.0),
+            },
+            "center_ground_m": _coerce_point_list(obj.get("center_ground_m"), 2),
+            "center_3d_m": _coerce_point_list(obj.get("center_3d_m"), 3),
+            "footprint_m": _coerce_point_list(obj.get("footprint_m"), 2),
+            "corners_3d_m": _coerce_point_list(obj.get("corners_3d_m"), 3),
+        })
+    return boxes
+
+
 class ObjectDetectionSubscriber(Node):
     def __init__(self, on_message, topic="/perception/objectdetection"):
         super().__init__("wautovantage_testbed_subscriber")
@@ -1307,6 +1411,7 @@ class PerceptionSubscriber(Node):
         on_ground_truth_lanes,
         on_gps_velocity,
         on_gps_heading,
+        on_yolo_3d_boxes=None,
         object_topic="/perception/objectdetection",
         lane_topic="/perception/lane_lines",
         stopbar_topic="/perception/stopbar",
@@ -1316,6 +1421,7 @@ class PerceptionSubscriber(Node):
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
         gps_velocity_topic=GPS_VELOCITY_TOPIC,
         gps_heading_topic=GPS_HEADING_TOPIC,
+        yolo_3d_bbox_topic=YOLO_3D_BBOX_TOPIC,
     ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
@@ -1327,6 +1433,7 @@ class PerceptionSubscriber(Node):
         self._on_ground_truth_lanes = on_ground_truth_lanes
         self._on_gps_velocity = on_gps_velocity
         self._on_gps_heading = on_gps_heading
+        self._on_yolo_3d_boxes = on_yolo_3d_boxes
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -1389,6 +1496,14 @@ class PerceptionSubscriber(Node):
                 GPSHeading,
                 gps_heading_topic,
                 self._gps_heading_callback,
+                10,
+            )
+        self.yolo_3d_bbox_subscription = None
+        if RosString is not None and self._on_yolo_3d_boxes is not None:
+            self.yolo_3d_bbox_subscription = self.create_subscription(
+                RosString,
+                yolo_3d_bbox_topic,
+                self._yolo_3d_bbox_callback,
                 10,
             )
 
@@ -1502,6 +1617,11 @@ class PerceptionSubscriber(Node):
             "azimuth": float(msg.azimuth),
         })
 
+    def _yolo_3d_bbox_callback(self, msg):
+        boxes = parse_yolo_3d_bbox_payload(getattr(msg, "data", ""))
+        if self._on_yolo_3d_boxes is not None:
+            self._on_yolo_3d_boxes(boxes)
+
 
 class ROSObjectDetectionBridge:
     def __init__(self, topic="/perception/objectdetection"):
@@ -1614,7 +1734,10 @@ class ROSPerceptionBridge:
         ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
         gps_velocity_topic=GPS_VELOCITY_TOPIC,
         gps_heading_topic=GPS_HEADING_TOPIC,
+        yolo_3d_bbox_topic=None,
     ):
+        if yolo_3d_bbox_topic is None:
+            yolo_3d_bbox_topic = read_str_env("WAUTOVANTAGE_YOLO_3D_BBOX_TOPIC", YOLO_3D_BBOX_TOPIC)
         self.enabled = False
         self.node = None
         self._lock = threading.Lock()
@@ -1629,6 +1752,7 @@ class ROSPerceptionBridge:
         self._latest_ground_truth_lane_stamp = 0.0
         self._latest_gps_velocity_stamp = 0.0
         self._latest_gps_heading_stamp = 0.0
+        self._latest_yolo_3d_bbox_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
         self._latest_stopbar_depth: Optional[float] = None
@@ -1640,6 +1764,7 @@ class ROSPerceptionBridge:
         self._latest_ground_truth_lanes: List[Dict[str, object]] = []
         self._latest_gps_velocity: Optional[Dict[str, float]] = None
         self._latest_gps_heading: Optional[Dict[str, float]] = None
+        self._latest_yolo_3d_boxes: List[Dict[str, object]] = []
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -1658,6 +1783,7 @@ class ROSPerceptionBridge:
                 self._store_ground_truth_lanes,
                 self._store_gps_velocity,
                 self._store_gps_heading,
+                self._store_yolo_3d_boxes,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
                 stopbar_topic=stopbar_topic,
@@ -1667,6 +1793,7 @@ class ROSPerceptionBridge:
                 ground_truth_lane_topic=ground_truth_lane_topic,
                 gps_velocity_topic=gps_velocity_topic,
                 gps_heading_topic=gps_heading_topic,
+                yolo_3d_bbox_topic=yolo_3d_bbox_topic,
             )
             self.enabled = True
             self._spin_thread = threading.Thread(
@@ -1677,11 +1804,13 @@ class ROSPerceptionBridge:
             self._spin_thread.start()
             gps_velocity_status = gps_velocity_topic if GPSVelocity is not None else f"{gps_velocity_topic} (message type unavailable)"
             gps_heading_status = gps_heading_topic if GPSHeading is not None else f"{gps_heading_topic} (message type unavailable)"
+            yolo_3d_bbox_status = yolo_3d_bbox_topic if RosString is not None else f"{yolo_3d_bbox_topic} (std_msgs/String unavailable)"
             print(
                 f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
                 f"'{stopbar_topic}', '{driveable_polygon_topic}', '{spatial_map_topic}', "
                 f"'{reference_path_topic}', '{ground_truth_lane_topic}', "
-                f"'{gps_velocity_status}', and '{gps_heading_status}'"
+                f"'{gps_velocity_status}', '{gps_heading_status}', and "
+                f"'{yolo_3d_bbox_status}'"
             )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
@@ -1733,6 +1862,11 @@ class ROSPerceptionBridge:
         with self._lock:
             self._latest_gps_heading = heading
             self._latest_gps_heading_stamp = time.perf_counter()
+
+    def _store_yolo_3d_boxes(self, boxes):
+        with self._lock:
+            self._latest_yolo_3d_boxes = boxes
+            self._latest_yolo_3d_bbox_stamp = time.perf_counter()
 
     def _spin_loop(self):
         while not self._stop_event.is_set() and self.enabled and self.node is not None:
@@ -1791,6 +1925,10 @@ class ROSPerceptionBridge:
         with self._lock:
             heading = dict(self._latest_gps_heading) if self._latest_gps_heading is not None else None
             return self._latest_gps_heading_stamp, heading
+
+    def latest_yolo_3d_bbox_snapshot(self):
+        with self._lock:
+            return self._latest_yolo_3d_bbox_stamp, [dict(box) for box in self._latest_yolo_3d_boxes]
 
     def close(self):
         self._stop_event.set()
@@ -2699,6 +2837,14 @@ class AVHMI(pyglet.window.Window):
         self._last_spatial_map_geometry_sync_time = 0.0
         self._spatial_map_visible = False
         self._latest_spatial_map_cell_count = 0
+        self.show_yolo_3d_boxes = read_bool_env("WAUTOVANTAGE_SHOW_YOLO_3D_BOXES", True)
+        self.yolo_3d_bbox_mesh: Optional[Mesh] = None
+        self._last_yolo_3d_bbox_stamp = 0.0
+        self._pending_yolo_3d_bbox_stamp = 0.0
+        self._pending_yolo_3d_boxes: List[Dict[str, object]] = []
+        self._last_yolo_3d_bbox_geometry_sync_time = 0.0
+        self._yolo_3d_bbox_visible = False
+        self._latest_yolo_3d_bbox_count = 0
         self.reference_path_mesh: Optional[Mesh] = None
         self._last_reference_path_stamp = 0.0
         self._pending_reference_path_stamp = 0.0
@@ -3459,6 +3605,140 @@ class AVHMI(pyglet.window.Window):
         self._spatial_map_visible = True
         self._latest_spatial_map_cell_count = len(verts) // 6
 
+    def _yolo_3d_color_for_class(self, class_id: int):
+        if class_id == 1:
+            return (0.20, 0.72, 1.0)
+        if class_id in (2, 12, 14, 16):
+            return (0.20, 1.0, 0.70)
+        if class_id == 3:
+            return (0.95, 0.70, 0.42)
+        if class_id == 7:
+            return (1.0, 0.44, 0.02)
+        if class_id == 9:
+            return (1.0, 0.88, 0.08)
+        return YOLO_3D_BBOX_DEFAULT_COLOR
+
+    def _sensor_point_to_local(self, point: Tuple[float, float, float], lift: float = 0.0):
+        local_pose = self._sensor_depth_to_local_pose(
+            float(point[0]),
+            float(point[1]),
+            float(point[2]),
+            lateral_offset=0.0,
+        )
+        local_pose[1] += lift
+        return tuple(local_pose)
+
+    def _yolo_box_corners(self, box: Dict[str, object]):
+        corners = box.get("corners_3d_m", [])
+        if isinstance(corners, list) and len(corners) >= 8:
+            return corners[:8]
+
+        dims = box.get("dimensions_m", {})
+        if not isinstance(dims, dict):
+            dims = {}
+        class_id = int(box.get("class_id", 255))
+        height = _safe_float(dims.get("height"), 0.0)
+        if not self._valid_dimension(height):
+            height = self._default_height_for_class(class_id)
+
+        footprint = box.get("footprint_m", [])
+        if isinstance(footprint, list) and len(footprint) >= 4:
+            bottom = [(float(p[0]), float(p[1]), 0.0) for p in footprint[:4]]
+            top = [(p[0], p[1], height) for p in bottom]
+            return bottom + top
+
+        center_ground = box.get("center_ground_m", [])
+        center_3d = box.get("center_3d_m", [])
+        if isinstance(center_ground, list) and center_ground:
+            center_forward = float(center_ground[0][0])
+            center_left = float(center_ground[0][1])
+            bottom_up = 0.0
+        elif isinstance(center_3d, list) and center_3d:
+            center_forward = float(center_3d[0][0])
+            center_left = float(center_3d[0][1])
+            bottom_up = max(0.0, float(center_3d[0][2]) - (height * 0.5))
+        else:
+            return []
+
+        length = _safe_float(dims.get("length"), 0.0)
+        width = _safe_float(dims.get("width"), 0.0)
+        if not self._valid_dimension(length) or not self._valid_dimension(width):
+            return []
+
+        yaw = _safe_float(box.get("yaw_rad"), 0.0)
+        length_axis = (math.cos(yaw), math.sin(yaw))
+        width_axis = (-math.sin(yaw), math.cos(yaw))
+        half_length = length * 0.5
+        half_width = width * 0.5
+        ground = []
+        for length_sign, width_sign in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
+            forward = (
+                center_forward
+                + length_axis[0] * half_length * length_sign
+                + width_axis[0] * half_width * width_sign
+            )
+            left = (
+                center_left
+                + length_axis[1] * half_length * length_sign
+                + width_axis[1] * half_width * width_sign
+            )
+            ground.append((forward, left, bottom_up))
+        return ground + [(p[0], p[1], p[2] + height) for p in ground]
+
+    def _sync_yolo_3d_boxes(self, boxes: List[Dict[str, object]]):
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+        rendered_count = 0
+        max_range_sq = SPATIAL_MAP_MAX_RANGE_M * SPATIAL_MAP_MAX_RANGE_M
+
+        for box in boxes:
+            corners = self._yolo_box_corners(box)
+            if len(corners) < 8:
+                continue
+            local_corners = []
+            for corner in corners[:8]:
+                if len(corner) < 3:
+                    local_corners = []
+                    break
+                forward = float(corner[0])
+                left = float(corner[1])
+                up = float(corner[2])
+                if not all(math.isfinite(v) and abs(v) < 9000.0 for v in (forward, left, up)):
+                    local_corners = []
+                    break
+                if forward * forward + left * left > max_range_sq:
+                    local_corners = []
+                    break
+                local_corners.append(self._sensor_point_to_local((forward, left, up), YOLO_3D_BBOX_RENDER_LIFT_M))
+            if len(local_corners) < 8:
+                continue
+
+            color = self._yolo_3d_color_for_class(int(box.get("class_id", 255)))
+            if not bool(box.get("valid_obb", True)):
+                color = (1.0, 0.25, 0.85)
+            for start_idx, end_idx in edges:
+                verts.append(local_corners[start_idx])
+                verts.append(local_corners[end_idx])
+                cols.append(color)
+                cols.append(color)
+            rendered_count += 1
+
+        if not verts:
+            self._yolo_3d_bbox_visible = False
+            self._latest_yolo_3d_bbox_count = 0
+            return
+
+        if self.yolo_3d_bbox_mesh is None:
+            self.yolo_3d_bbox_mesh = Mesh([], [], None, None, gl.GL_LINES, mat4_identity())
+        self.renderer.update_color_mesh(self.yolo_3d_bbox_mesh, verts, cols, gl.GL_LINES)
+        self._yolo_3d_bbox_visible = True
+        self._latest_yolo_3d_bbox_count = rendered_count
+
     def _sync_reference_path(self, poses: List[Tuple[float, ...]]):
         enu_poses = []
         for pose in poses:
@@ -4019,6 +4299,7 @@ class AVHMI(pyglet.window.Window):
             )
             gps_velocity_stamp, gps_velocity = self.perception_bridge.latest_gps_velocity_snapshot()
             gps_heading_stamp, gps_heading = self.perception_bridge.latest_gps_heading_snapshot()
+            yolo_3d_bbox_stamp, yolo_3d_boxes = self.perception_bridge.latest_yolo_3d_bbox_snapshot()
 
         if gps_heading_stamp > self._last_gps_heading_stamp:
             self._sync_gps_heading(gps_heading)
@@ -4093,6 +4374,27 @@ class AVHMI(pyglet.window.Window):
         else:
             self._spatial_map_visible = False
             self._latest_spatial_map_cell_count = 0
+
+        if self.show_yolo_3d_boxes:
+            if yolo_3d_bbox_stamp > self._pending_yolo_3d_bbox_stamp:
+                self._pending_yolo_3d_bbox_stamp = yolo_3d_bbox_stamp
+                self._pending_yolo_3d_boxes = yolo_3d_boxes
+            if (
+                self._pending_yolo_3d_bbox_stamp > self._last_yolo_3d_bbox_stamp
+                and now - self._last_yolo_3d_bbox_geometry_sync_time >= self._perception_geometry_min_interval
+            ):
+                with self.profiler.section("mesh_yolo_3d_bbox"):
+                    self._sync_yolo_3d_boxes(self._pending_yolo_3d_boxes)
+                self._last_yolo_3d_bbox_stamp = self._pending_yolo_3d_bbox_stamp
+                self._last_yolo_3d_bbox_geometry_sync_time = now
+
+            if self.yolo_3d_bbox_mesh is not None and self._last_yolo_3d_bbox_stamp > 0.0:
+                if time.perf_counter() - self._last_yolo_3d_bbox_stamp > YOLO_3D_BBOX_FRESHNESS_SEC:
+                    self._yolo_3d_bbox_visible = False
+                    self._latest_yolo_3d_bbox_count = 0
+        else:
+            self._yolo_3d_bbox_visible = False
+            self._latest_yolo_3d_bbox_count = 0
 
         if reference_path_stamp > self._pending_reference_path_stamp:
             self._pending_reference_path_stamp = reference_path_stamp
@@ -4196,6 +4498,12 @@ class AVHMI(pyglet.window.Window):
             self.spatial_map_mesh.model = car_M
             self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
 
+        if self.show_yolo_3d_boxes and self.yolo_3d_bbox_mesh is not None and self._yolo_3d_bbox_visible:
+            self.yolo_3d_bbox_mesh.model = car_M
+            gl.glLineWidth(YOLO_3D_BBOX_LINE_WIDTH_PX)
+            self.renderer.draw_mesh(self.yolo_3d_bbox_mesh, pv, alpha=1.0)
+            gl.glLineWidth(1.0)
+
         if self.reference_path_mesh is not None and self._reference_path_visible:
             self.reference_path_mesh.model = self._reference_path_anchor_model or mat4_identity()
             self._draw_translucent_mesh(self.reference_path_mesh, pv, alpha=1.0)
@@ -4290,6 +4598,7 @@ class AVHMI(pyglet.window.Window):
                     f"{heading_status}   "
                     f"{ros_status}   "
                     f"Objects {len(self.detected_entities)}   "
+                    f"OBB {self._latest_yolo_3d_bbox_count}   "
                     f"Lanes {self._latest_lane_count}   "
                     f"GT {self._latest_ground_truth_lane_count}   "
                     f"Path {self._latest_reference_path_count}   "
