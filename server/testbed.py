@@ -1,37 +1,61 @@
 # Pyglet 2.1.9 • Modern OpenGL (core profile) • Textured OBJ support
-import math, time, ctypes, os
+import json, math, time, ctypes, os, threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import pyglet
-from pyglet.window import key, mouse
+from pyglet.window import key
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
 try:
     import rclpy
     from rclpy.node import Node
-    from wauto_perception_msgs.msg import ObjectArray, LaneArray
+    from wauto_perception_msgs.msg import ObjectArray, LaneArray, StopbarDepth, SpatialMap
+    from geometry_msgs.msg import PolygonStamped
+    from nav_msgs.msg import Path as NavPath
+    try:
+        from std_msgs.msg import String as RosString
+    except ImportError:
+        RosString = None
+    try:
+        from visualization_msgs.msg import MarkerArray
+    except ImportError:
+        MarkerArray = None
+    try:
+        from wauto_localization_msgs.msg import GPSVelocity
+    except ImportError:
+        GPSVelocity = None
+    try:
+        from wauto_localization_msgs.msg import GPSHeading
+    except ImportError:
+        GPSHeading = None
     ROS2_AVAILABLE = True
 except ImportError:
     rclpy = None
     Node = object
     ObjectArray = None
     LaneArray = None
+    StopbarDepth = None
+    SpatialMap = None
+    PolygonStamped = None
+    NavPath = None
+    RosString = None
+    MarkerArray = None
+    GPSVelocity = None
+    GPSHeading = None
     ROS2_AVAILABLE = False
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(REPO_ROOT, "assets")
-DETECTION_YAW_CORRECTION_DEG = -6.0
-DETECTION_LATERAL_OFFSET_M = -1.0
+DETECTION_YAW_CORRECTION_DEG = 0.0
+DETECTION_LATERAL_OFFSET_M = 0.0
 DETECTION_YAW_CORRECTION_RAD = math.radians(DETECTION_YAW_CORRECTION_DEG)
-VEHICLE_CENTER_CORRECTION_CLASSES = {1, 11, 13}
 LANE_CONSENSUS_CLASSES = {1, 11, 13}
-VEHICLE_CENTER_HALF_LENGTH_M = 2.2
-VEHICLE_CENTER_HALF_WIDTH_M = 0.9
 VEHICLE_AXIS_MIN_STEP_M = 0.12
-STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10}
+STATIC_REFERENCE_CLASSES = {4, 5, 6, 7, 8, 9, 10, 18, 19}
 MOTION_HEADING_CLASSES = {1, 2, 11, 13, 16}
 HEADING_SMOOTH_ALPHA = 0.3
 HEADING_CONFIRM_FRAMES = 5
@@ -61,16 +85,144 @@ LANE_LINE_CONFIDENCE_MIN = 0.30
 LANE_LINE_RENDER_LIFT_M = 0.04
 LANE_LINE_WIDTH_M = 0.18
 LANE_LINE_SMOOTHING_PASSES = 2
+STOPBAR_RENDER_LIFT_M = 0.035
+STOPBAR_WIDTH_M = 5.0
+STOPBAR_THICKNESS_M = 0.38
+STOPBAR_FRESHNESS_SEC = 0.8
+DRIVEABLE_POLYGON_RENDER_LIFT_M = 0.02
+DRIVEABLE_POLYGON_FRESHNESS_SEC = 0.8
+SPATIAL_MAP_RENDER_LIFT_M = 0.025
+SPATIAL_MAP_FRESHNESS_SEC = 0.8
+SPATIAL_MAP_CELL_COLOR = (0.86, 0.55, 0.55)
+SPATIAL_MAP_RENDER_ALPHA = 0.55
+SPATIAL_MAP_MAX_RANGE_M = 80.0
+YOLO_3D_BBOX_TOPIC = "/perception/hybrid_yolo_detections"
+YOLO_3D_BBOX_RENDER_LIFT_M = 0.035
+YOLO_3D_BBOX_FRESHNESS_SEC = 0.8
+YOLO_3D_BBOX_LINE_WIDTH_PX = 3.0
+YOLO_3D_BBOX_DEFAULT_COLOR = (1.0, 0.82, 0.18)
+REFERENCE_PATH_TOPIC = "/y5_mid_planner/debug/reference_path"
+REFERENCE_PATH_RENDER_LIFT_M = 0.09
+REFERENCE_PATH_WIDTH_M = 2.0
+REFERENCE_PATH_COLOR = (0.0, 0.92, 1.0)
+REFERENCE_PATH_EDGE_ALPHA = 0.12
+REFERENCE_PATH_FRESHNESS_SEC = 2.0
+GROUND_TRUTH_LANE_TOPIC = "/y5_mid_planner/debug/restrictions"
+GPS_VELOCITY_TOPIC = "/wauto_localization_msgs/gps/GPSVelocity"
+GPS_HEADING_TOPIC = "/wauto_localization_msgs/gps/GPSHeading"
+GROUND_TRUTH_LANE_RENDER_LIFT_M = 0.065
+GROUND_TRUTH_LANE_WIDTH_M = 0.15
+GROUND_TRUTH_LANE_COLOR = (0.0, 1.0, 0.30)
+GROUND_TRUTH_LANE_RENDER_ALPHA = 0.32
+GROUND_TRUTH_LANE_FRESHNESS_SEC = 0.6
+SIGN_OVERLAY_EGO_FACE_OFFSET_M = -0.036
+SIGN_OVERLAY_LAYER_STEP_M = 0.006
 LANE_ORIENTATION_CLASSES = {1, 11, 13}
 LANE_ORIENTATION_SNAP_DISTANCE_M = 4.5
 LANE_ORIENTATION_MIN_SEGMENT_M = 0.35
 LANE_ORIENTATION_CELL_SIZE_M = 6.0
 ORIENTATION_UPDATE_INTERVAL_FRAMES = 3
 GROUND_SPEED_FRESHNESS_SEC = 0.45
+GPS_VELOCITY_FRESHNESS_SEC = 0.75
+GPS_HEADING_FRESHNESS_SEC = 1.0
 
 
 def asset_path(*parts: str) -> str:
     return os.path.join(ASSETS_DIR, *parts)
+
+
+def read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using default {default}")
+        return default
+
+
+def read_float_env(name: str, default: float, minimum: Optional[float] = None) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        print(f"Invalid {name}={value!r}; using default {default}")
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def read_str_env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
+
+
+def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
+    return math.atan2(
+        2.0 * ((w * z) + (x * y)),
+        1.0 - (2.0 * ((y * y) + (z * z))),
+    )
+
+
+class FrameProfiler:
+    def __init__(self, enabled: bool = False, interval_sec: float = 2.0):
+        self.enabled = enabled
+        self.interval_sec = max(0.25, interval_sec)
+        self._last_report = time.perf_counter()
+        self._frames = 0
+        self._totals: Dict[str, float] = {}
+        self._counts: Dict[str, int] = {}
+
+    @contextmanager
+    def section(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - start)
+
+    def add(self, name: str, elapsed_sec: float):
+        if not self.enabled:
+            return
+        self._totals[name] = self._totals.get(name, 0.0) + elapsed_sec
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+    def frame(self):
+        if not self.enabled:
+            return
+        self._frames += 1
+        now = time.perf_counter()
+        elapsed = now - self._last_report
+        if elapsed < self.interval_sec:
+            return
+
+        fps = self._frames / max(1e-6, elapsed)
+        parts = [f"fps={fps:5.1f}"]
+        for name in sorted(self._totals):
+            count = max(1, self._counts.get(name, 1))
+            parts.append(f"{name}={self._totals[name] * 1000.0 / count:5.2f}ms")
+        print("[profile] " + "  ".join(parts))
+        self._last_report = now
+        self._frames = 0
+        self._totals.clear()
+        self._counts.clear()
 
 
 # ------------------------------------------------------------
@@ -218,6 +370,14 @@ def mat4_mul(a, b):  # a @ b, column-major
                             a[3*4 + r]*b[c*4 + 3])
     return out
 
+def mat4_transform_point(m, x: float, y: float, z: float):
+    return (
+        m[0] * x + m[4] * y + m[8]  * z + m[12],
+        m[1] * x + m[5] * y + m[9]  * z + m[13],
+        m[2] * x + m[6] * y + m[10] * z + m[14],
+        m[3] * x + m[7] * y + m[11] * z + m[15],
+    )
+
 def mat4_translate(x, y, z):
     m = mat4_identity()
     m[12], m[13], m[14] = x, y, z
@@ -243,6 +403,15 @@ def mat4_rotate_z(theta):
              s, c,0,0,
              0, 0,1,0,
              0, 0,0,1]
+
+def transform_vertices(verts, matrix):
+    transformed = []
+    for x, y, z in verts:
+        tx, ty, tz, tw = mat4_transform_point(matrix, x, y, z)
+        if abs(tw) > 1e-9:
+            tx, ty, tz = tx / tw, ty / tw, tz / tw
+        transformed.append((tx, ty, tz))
+    return transformed
 
 def mat4_scale(sx, sy, sz):
     return [sx,0, 0, 0,
@@ -292,21 +461,39 @@ def look_at(eye, center, up):
 VERT_COLOR = """
 #version 330
 layout(location = 0) in vec3 in_pos;
-layout(location = 1) in vec3 in_col;
+layout(location = 1) in vec4 in_col;
 uniform mat4 u_mvp;
-out vec3 v_col;
+out vec4 v_col;
 void main(){
     v_col = in_col;
     gl_Position = u_mvp * vec4(in_pos, 1.0);
 }
 """
 
+VERT_COLOR_INSTANCED = """
+#version 330
+layout(location = 0) in vec3 in_pos;
+layout(location = 1) in vec4 in_col;
+layout(location = 2) in vec4 in_model_col0;
+layout(location = 3) in vec4 in_model_col1;
+layout(location = 4) in vec4 in_model_col2;
+layout(location = 5) in vec4 in_model_col3;
+uniform mat4 u_proj_view;
+out vec4 v_col;
+void main(){
+    v_col = in_col;
+    mat4 in_model = mat4(in_model_col0, in_model_col1, in_model_col2, in_model_col3);
+    gl_Position = u_proj_view * in_model * vec4(in_pos, 1.0);
+}
+"""
+
 FRAG_COLOR = """
 #version 330
-in vec3 v_col;
+in vec4 v_col;
+uniform float u_alpha;
 out vec4 out_col;
 void main(){
-    out_col = vec4(v_col, 1.0);
+    out_col = vec4(v_col.rgb, v_col.a * u_alpha);
 }
 """
 
@@ -355,6 +542,42 @@ def make_box_triangles(lx, ly, lz, color=(0.1, 0.8, 0.3)):
     ]
     cols = [color]*len(faces)
     return faces, cols
+
+
+def translate_mesh(verts, dx: float, dy: float, dz: float):
+    return [(x + dx, y + dy, z + dz) for x, y, z in verts]
+
+
+def rotate_mesh_y_180(verts):
+    return [(-x, y, -z) for x, y, z in verts]
+
+
+def make_circular_lens(radius: float, depth: float, color=(0.9, 0.1, 0.1), segments: int = 24):
+    """Create a shallow circular lens facing +Z."""
+    front_z = depth * 0.5
+    back_z = -depth * 0.5
+    verts = []
+    cols = []
+    ring_front = []
+    ring_back = []
+    for i in range(segments):
+        ang = (2.0 * math.pi * i) / float(segments)
+        x = radius * math.cos(ang)
+        y = radius * math.sin(ang)
+        ring_front.append((x, y, front_z))
+        ring_back.append((x, y, back_z))
+
+    front_center = (0.0, 0.0, front_z)
+    back_center = (0.0, 0.0, back_z)
+    for i in range(segments):
+        j = (i + 1) % segments
+        verts.extend([front_center, ring_front[i], ring_front[j]])
+        cols.extend([color, color, color])
+        verts.extend([back_center, ring_back[j], ring_back[i]])
+        cols.extend([color, color, color])
+        verts.extend([ring_front[i], ring_back[i], ring_back[j], ring_front[i], ring_back[j], ring_front[j]])
+        cols.extend([color] * 6)
+    return verts, cols
 
 def make_polyline(points, color=(1.0, 1.0, 0.2)):
     verts, cols = [], []
@@ -409,7 +632,7 @@ def resample_polyline_for_orientation(points, min_segment_length):
     return sampled
 
 
-def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
+def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2), edge_alpha: Optional[float] = None):
     if len(points) < 2:
         return [], []
 
@@ -440,6 +663,22 @@ def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
 
     verts = []
     cols = []
+    if edge_alpha is not None:
+        edge_color = (color[0], color[1], color[2], clamp(edge_alpha, 0.0, 1.0))
+        center_color = (color[0], color[1], color[2], 1.0)
+        for i in range(len(points) - 1):
+            left_a = left_pts[i]
+            center_a = points[i]
+            right_a = right_pts[i]
+            left_b = left_pts[i + 1]
+            center_b = points[i + 1]
+            right_b = right_pts[i + 1]
+            verts.extend((left_a, center_a, center_b, left_a, center_b, left_b))
+            cols.extend((edge_color, center_color, center_color, edge_color, center_color, edge_color))
+            verts.extend((center_a, right_a, right_b, center_a, right_b, center_b))
+            cols.extend((center_color, edge_color, edge_color, center_color, edge_color, center_color))
+        return verts, cols
+
     for i in range(len(points) - 1):
         a = left_pts[i]
         b = right_pts[i]
@@ -447,6 +686,86 @@ def make_polyline_ribbon(points, width=0.15, color=(1.0, 1.0, 0.2)):
         d = right_pts[i + 1]
         verts.extend((a, b, d, a, d, c))
         cols.extend((color, color, color, color, color, color))
+    return verts, cols
+
+
+def make_ground_rect(width: float, thickness: float, center_z: float, lift: float, color=(1.0, 1.0, 1.0)):
+    half_width = width * 0.5
+    half_thickness = thickness * 0.5
+    z0 = center_z - half_thickness
+    z1 = center_z + half_thickness
+    verts = [
+        (-half_width, lift, z0),
+        ( half_width, lift, z0),
+        ( half_width, lift, z1),
+        (-half_width, lift, z0),
+        ( half_width, lift, z1),
+        (-half_width, lift, z1),
+    ]
+    return verts, [color] * len(verts)
+
+
+def triangulate_polygon(points, color=(0.46, 0.46, 0.46)):
+    eps = 1e-6
+    polygon = []
+    for point in points:
+        if not polygon or math.hypot(point[0] - polygon[-1][0], point[2] - polygon[-1][2]) > eps:
+            polygon.append(point)
+    if len(polygon) > 1 and math.hypot(polygon[0][0] - polygon[-1][0], polygon[0][2] - polygon[-1][2]) <= eps:
+        polygon.pop()
+    if len(polygon) < 3:
+        return [], []
+
+    def signed_area():
+        area = 0.0
+        for i, point in enumerate(polygon):
+            next_point = polygon[(i + 1) % len(polygon)]
+            area += point[0] * next_point[2] - next_point[0] * point[2]
+        return area * 0.5
+
+    if signed_area() < 0.0:
+        polygon.reverse()
+
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0])
+
+    def point_in_triangle(point, a, b, c):
+        return (
+            cross(a, b, point) >= -eps
+            and cross(b, c, point) >= -eps
+            and cross(c, a, point) >= -eps
+        )
+
+    def add_triangle(a, b, c):
+        verts.extend((a, b, c))
+        cols.extend((color, color, color))
+
+    verts = []
+    cols = []
+    remaining = list(range(len(polygon)))
+
+    while len(remaining) > 3:
+        for pos, curr_idx in enumerate(remaining):
+            prev_idx = remaining[pos - 1]
+            next_idx = remaining[(pos + 1) % len(remaining)]
+            a = polygon[prev_idx]
+            b = polygon[curr_idx]
+            c = polygon[next_idx]
+            if cross(a, b, c) <= eps:
+                continue
+            if any(
+                point_in_triangle(polygon[test_idx], a, b, c)
+                for test_idx in remaining
+                if test_idx not in (prev_idx, curr_idx, next_idx)
+            ):
+                continue
+            add_triangle(a, b, c)
+            del remaining[pos]
+            break
+        else:
+            return [], []
+
+    add_triangle(polygon[remaining[0]], polygon[remaining[1]], polygon[remaining[2]])
     return verts, cols
 
 def make_grid(size=80, step=2.0, color=(0.25, 0.25, 0.25)):
@@ -582,6 +901,189 @@ def make_rounded_rect_sign(width: float, height: float, thickness: float, color=
         cols.extend([color] * 6)
 
     return verts, cols
+
+
+def transform_sign_verts(verts, sx: float = 1.0, sz: float = 1.0, dx: float = 0.0, dz: float = 0.0):
+    return [((x * sx) + dx, y, (z * sz) + dz) for x, y, z in verts]
+
+
+def append_sign_part(parts, verts, cols, sx: float = 1.0, sz: float = 1.0, dx: float = 0.0, dz: float = 0.0):
+    parts.append((transform_sign_verts(verts, sx=sx, sz=sz, dx=dx, dz=dz), cols))
+
+
+def append_sign_part_matrix(parts, verts, cols, matrix):
+    parts.append((transform_vertices(verts, matrix), cols))
+
+
+def make_sign_bar(width: float, height: float, thickness: float, color, dx: float = 0.0, dz: float = 0.0):
+    verts, cols = make_box_triangles(width, thickness, height, color)
+    return transform_sign_verts(verts, dx=dx, dz=dz), cols
+
+
+def make_sign_ring(outer_radius: float, inner_radius: float, thickness: float, color, segments: int = 32):
+    inner_radius = min(inner_radius, outer_radius - 1e-4)
+    front_y = 0.0
+    back_y = -thickness
+    outer_front = []
+    inner_front = []
+    outer_back = []
+    inner_back = []
+    for i in range(segments):
+        ang = (2.0 * math.pi * i) / float(segments)
+        ca = math.cos(ang)
+        sa = math.sin(ang)
+        outer_front.append((outer_radius * ca, front_y, outer_radius * sa))
+        inner_front.append((inner_radius * ca, front_y, inner_radius * sa))
+        outer_back.append((outer_radius * ca, back_y, outer_radius * sa))
+        inner_back.append((inner_radius * ca, back_y, inner_radius * sa))
+
+    verts = []
+    cols = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        verts.extend([outer_front[i], outer_front[j], inner_front[j], outer_front[i], inner_front[j], inner_front[i]])
+        verts.extend([outer_back[i], inner_back[j], outer_back[j], outer_back[i], inner_back[i], inner_back[j]])
+        verts.extend([outer_front[i], outer_back[i], outer_back[j], outer_front[i], outer_back[j], outer_front[j]])
+        verts.extend([inner_front[i], inner_front[j], inner_back[j], inner_front[i], inner_back[j], inner_back[i]])
+        cols.extend([color] * 24)
+    return verts, cols
+
+
+def make_sign_arrow(direction: str, color=(0.05, 0.05, 0.05), thickness: float = 0.012):
+    sign = -1.0 if direction == "left" else 1.0
+    verts = []
+    cols = []
+    shaft_verts, shaft_cols = make_box_triangles(0.34, thickness, 0.11, color)
+    verts.extend(transform_sign_verts(shaft_verts, dx=-0.04 * sign))
+    cols.extend(shaft_cols)
+
+    head = [
+        (0.0, 0.0, 0.16),
+        (0.18 * sign, 0.0, 0.0),
+        (0.0, 0.0, -0.16),
+        (0.0, -thickness, 0.16),
+        (0.18 * sign, -thickness, 0.0),
+        (0.0, -thickness, -0.16),
+    ]
+    verts.extend([head[0], head[1], head[2], head[3], head[5], head[4]])
+    cols.extend([color] * 6)
+    for a, b, c, d in ((0, 1, 3, 4), (1, 2, 4, 5), (2, 0, 5, 3)):
+        verts.extend([head[a], head[b], head[d], head[a], head[d], head[c]])
+        cols.extend([color] * 6)
+    return verts, cols
+
+
+def make_sign_text_block(text: str, scale: float = 1.0, color=(0.04, 0.04, 0.04), thickness: float = 0.012):
+    digit_patterns = {
+        "2": ("111", "001", "111", "100", "111"),
+        "5": ("111", "100", "111", "001", "111"),
+        "S": ("111", "100", "111", "001", "111"),
+        "T": ("111", "010", "010", "010", "010"),
+        "O": ("111", "101", "101", "101", "111"),
+        "P": ("111", "101", "111", "100", "100"),
+    }
+    cell = 0.045 * scale
+    gap = 0.012 * scale
+    digit_w = 3 * cell
+    digit_h = 5 * cell
+    total_w = (len(text) * digit_w) + (max(0, len(text) - 1) * gap)
+    verts = []
+    cols = []
+    start_x = -total_w * 0.5
+    start_z = digit_h * 0.5
+    for digit_index, char in enumerate(text):
+        pattern = digit_patterns.get(char)
+        if pattern is None:
+            continue
+        base_x = start_x + digit_index * (digit_w + gap)
+        for row, row_bits in enumerate(pattern):
+            for col, bit in enumerate(row_bits):
+                if bit != "1":
+                    continue
+                cx = base_x + (col + 0.5) * cell
+                cz = start_z - (row + 0.5) * cell
+                block_verts, block_cols = make_box_triangles(cell * 0.82, thickness, cell * 0.82, color)
+                verts.extend(transform_sign_verts(block_verts, dx=cx, dz=cz))
+                cols.extend(block_cols)
+    return verts, cols
+
+
+def make_no_turn_overlay(direction: str):
+    parts = []
+    arrow_verts, arrow_cols = make_sign_arrow(direction, color=(0.02, 0.02, 0.02), thickness=0.014)
+    append_sign_part(parts, arrow_verts, arrow_cols)
+    ring_verts, ring_cols = make_sign_ring(0.37, 0.31, 0.012, (0.88, 0.03, 0.03))
+    append_sign_part(parts, ring_verts, ring_cols)
+    slash_verts, slash_cols = make_sign_bar(0.08, 0.82, 0.014, (0.88, 0.03, 0.03))
+    append_sign_part_matrix(parts, slash_verts, slash_cols, mat4_rotate_y(math.radians(38.0)))
+    return parts
+
+
+def make_street_sign_parts(kind: str, thickness: float, scale: float = 1.0):
+    parts = []
+    black = (0.04, 0.04, 0.04)
+    white = (1.0, 1.0, 1.0)
+    red = (0.9, 0.04, 0.04)
+    yellow = (0.95, 0.82, 0.08)
+
+    if kind == "stop":
+        verts, cols = make_regular_polygon(8, 0.46 * scale, thickness, red, angle_offset=math.pi / 8.0)
+        append_sign_part(parts, verts, cols)
+        text_verts, text_cols = make_sign_text_block("STOP", scale=1.35 * scale, color=white, thickness=thickness * 0.7)
+        append_sign_part(parts, text_verts, text_cols)
+        return parts
+
+    if kind == "yield":
+        border_verts, border_cols = make_triangle_sign(0.98 * scale, thickness, red)
+        append_sign_part(parts, border_verts, border_cols)
+        face_verts, face_cols = make_triangle_sign(0.74 * scale, thickness * 0.7, white)
+        append_sign_part(parts, face_verts, face_cols)
+        return parts
+
+    if kind == "do_not_enter":
+        circle_verts, circle_cols = make_regular_polygon(32, 0.42 * scale, thickness, red)
+        append_sign_part(parts, circle_verts, circle_cols)
+        bar_verts, bar_cols = make_sign_bar(0.62 * scale, 0.12 * scale, thickness * 0.8, white)
+        append_sign_part(parts, bar_verts, bar_cols)
+        return parts
+
+    if kind == "pedestrian":
+        diamond_verts, diamond_cols = make_regular_polygon(4, 0.48 * scale, thickness, yellow, angle_offset=0.0)
+        append_sign_part(parts, diamond_verts, diamond_cols)
+        head_verts, head_cols = make_regular_polygon(16, 0.055 * scale, thickness * 0.7, black)
+        append_sign_part(parts, head_verts, head_cols, dx=0.0, dz=0.16 * scale)
+        body_verts, body_cols = make_sign_bar(0.08 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part(parts, body_verts, body_cols, dz=-0.02 * scale)
+        leg_l_verts, leg_l_cols = make_sign_bar(0.055 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part_matrix(parts, transform_sign_verts(leg_l_verts, dx=-0.06 * scale, dz=-0.18 * scale), leg_l_cols, mat4_rotate_y(math.radians(-28.0)))
+        leg_r_verts, leg_r_cols = make_sign_bar(0.055 * scale, 0.22 * scale, thickness * 0.7, black)
+        append_sign_part_matrix(parts, transform_sign_verts(leg_r_verts, dx=0.06 * scale, dz=-0.18 * scale), leg_r_cols, mat4_rotate_y(math.radians(28.0)))
+        return parts
+
+    if kind == "railroad":
+        bar1_verts, bar1_cols = make_sign_bar(0.11 * scale, 0.98 * scale, thickness, white)
+        append_sign_part_matrix(parts, bar1_verts, bar1_cols, mat4_rotate_y(math.radians(45.0)))
+        bar2_verts, bar2_cols = make_sign_bar(0.11 * scale, 0.98 * scale, thickness, white)
+        append_sign_part_matrix(parts, bar2_verts, bar2_cols, mat4_rotate_y(math.radians(-45.0)))
+        return parts
+
+    if kind == "one_way":
+        bg_verts, bg_cols = make_rounded_rect_sign(0.9 * scale, 0.42 * scale, thickness, black, radius=0.04 * scale)
+        append_sign_part(parts, bg_verts, bg_cols)
+        arrow_verts, arrow_cols = make_sign_arrow("right", color=white, thickness=thickness * 0.75)
+        append_sign_part(parts, arrow_verts, arrow_cols, sx=1.25 * scale, sz=1.0 * scale)
+        return parts
+
+    bg_verts, bg_cols = make_rounded_rect_sign(0.78 * scale, 0.92 * scale, thickness, white, radius=0.12 * scale)
+    append_sign_part(parts, bg_verts, bg_cols)
+    if kind == "speed":
+        text_verts, text_cols = make_sign_text_block("25", scale=2.0 * scale, color=black, thickness=thickness * 0.7)
+        append_sign_part(parts, text_verts, text_cols)
+    elif kind == "no_right":
+        parts.extend(make_no_turn_overlay("right"))
+    elif kind == "no_left":
+        parts.extend(make_no_turn_overlay("left"))
+    return parts
 
 # ------------------------------------------------------------
 # Barricade builder: trapezoidal prism
@@ -750,6 +1252,100 @@ def center_ground_mesh_vertices(verts: List[Tuple[float, float, float]]):
     return [(x - cx, y - ymin, z - cz) for (x, y, z) in verts]
 
 
+def _safe_float(value, default=0.0):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _coerce_point_list(value, width: int):
+    if value is None or width <= 0:
+        return []
+    points = []
+    if isinstance(value, (list, tuple)):
+        if value and all(isinstance(v, (int, float)) for v in value):
+            for idx in range(0, len(value) - width + 1, width):
+                point = tuple(_safe_float(v, float("nan")) for v in value[idx:idx + width])
+                if all(math.isfinite(v) and abs(v) < 9000.0 for v in point):
+                    points.append(point)
+            return points
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) < width:
+                continue
+            point = tuple(_safe_float(v, float("nan")) for v in item[:width])
+            if all(math.isfinite(v) and abs(v) < 9000.0 for v in point):
+                points.append(point)
+    return points
+
+
+def parse_yolo_3d_bbox_payload(payload: str):
+    if not payload:
+        return []
+    text = str(payload).strip()
+    if text.startswith("YOLO_DETECTIONS:"):
+        text = text[len("YOLO_DETECTIONS:"):].strip()
+    try:
+        decoded = json.loads(text)
+    except ValueError as exc:
+        print(f"Invalid YOLO 3D bbox payload: {exc}: {text[:160]}")
+        return []
+
+    if isinstance(decoded, list):
+        raw_objects = decoded
+    elif isinstance(decoded, dict):
+        raw_objects = decoded.get("objects", decoded.get("detections", []))
+    else:
+        raw_objects = []
+
+    boxes = []
+    for idx, obj in enumerate(raw_objects):
+        if not isinstance(obj, dict):
+            continue
+        dims = obj.get("dimensions_m", {})
+        if not isinstance(dims, dict):
+            dims = {}
+        boxes.append({
+            "id": _safe_int(obj.get("id", obj.get("object_id", idx)), idx),
+            "class_id": _safe_int(obj.get("class_id", obj.get("obj_class", 255)), 255),
+            "confidence": _safe_float(obj.get("confidence", 0.0), 0.0),
+            "valid_obb": _safe_bool(obj.get("valid_obb", True), True),
+            "yaw_rad": _safe_float(obj.get("yaw_rad", 0.0), 0.0),
+            "dimensions_m": {
+                "length": _safe_float(dims.get("length", obj.get("length")), 0.0),
+                "width": _safe_float(dims.get("width", obj.get("width")), 0.0),
+                "height": _safe_float(dims.get("height", obj.get("height")), 0.0),
+            },
+            "center_ground_m": _coerce_point_list(obj.get("center_ground_m"), 2),
+            "center_3d_m": _coerce_point_list(obj.get("center_3d_m"), 3),
+            "footprint_m": _coerce_point_list(obj.get("footprint_m"), 2),
+            "corners_3d_m": _coerce_point_list(obj.get("corners_3d_m"), 3),
+        })
+    return boxes
+
+
 class ObjectDetectionSubscriber(Node):
     def __init__(self, on_message, topic="/perception/objectdetection"):
         super().__init__("wautovantage_testbed_subscriber")
@@ -804,10 +1400,40 @@ class LaneLineSubscriber(Node):
 
 
 class PerceptionSubscriber(Node):
-    def __init__(self, on_objects, on_lanes, object_topic="/perception/objectdetection", lane_topic="/perception/lane_lines"):
+    def __init__(
+        self,
+        on_objects,
+        on_lanes,
+        on_stopbar,
+        on_driveable_polygon,
+        on_spatial_map,
+        on_reference_path,
+        on_ground_truth_lanes,
+        on_gps_velocity,
+        on_gps_heading,
+        on_yolo_3d_boxes=None,
+        object_topic="/perception/objectdetection",
+        lane_topic="/perception/lane_lines",
+        stopbar_topic="/perception/stopbar",
+        driveable_polygon_topic="/perception/driveable_polygon",
+        spatial_map_topic="/perception/spatial_map",
+        reference_path_topic=REFERENCE_PATH_TOPIC,
+        ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
+        gps_velocity_topic=GPS_VELOCITY_TOPIC,
+        gps_heading_topic=GPS_HEADING_TOPIC,
+        yolo_3d_bbox_topic=YOLO_3D_BBOX_TOPIC,
+    ):
         super().__init__("wautovantage_perception_testbed_subscriber")
         self._on_objects = on_objects
         self._on_lanes = on_lanes
+        self._on_stopbar = on_stopbar
+        self._on_driveable_polygon = on_driveable_polygon
+        self._on_spatial_map = on_spatial_map
+        self._on_reference_path = on_reference_path
+        self._on_ground_truth_lanes = on_ground_truth_lanes
+        self._on_gps_velocity = on_gps_velocity
+        self._on_gps_heading = on_gps_heading
+        self._on_yolo_3d_boxes = on_yolo_3d_boxes
         self.object_subscription = self.create_subscription(
             ObjectArray,
             object_topic,
@@ -820,6 +1446,66 @@ class PerceptionSubscriber(Node):
             self._lane_callback,
             10,
         )
+        self.stopbar_subscription = self.create_subscription(
+            StopbarDepth,
+            stopbar_topic,
+            self._stopbar_callback,
+            10,
+        )
+        self.driveable_polygon_subscription = self.create_subscription(
+            PolygonStamped,
+            driveable_polygon_topic,
+            self._driveable_polygon_callback,
+            10,
+        )
+        self.spatial_map_subscription = None
+        if SpatialMap is not None:
+            self.spatial_map_subscription = self.create_subscription(
+                SpatialMap,
+                spatial_map_topic,
+                self._spatial_map_callback,
+                10,
+            )
+        self.reference_path_subscription = None
+        if NavPath is not None:
+            self.reference_path_subscription = self.create_subscription(
+                NavPath,
+                reference_path_topic,
+                self._reference_path_callback,
+                10,
+            )
+        self.ground_truth_lane_subscription = None
+        if MarkerArray is not None:
+            self.ground_truth_lane_subscription = self.create_subscription(
+                MarkerArray,
+                ground_truth_lane_topic,
+                self._ground_truth_lane_callback,
+                10,
+            )
+        self.gps_velocity_subscription = None
+        if GPSVelocity is not None:
+            self.gps_velocity_subscription = self.create_subscription(
+                GPSVelocity,
+                gps_velocity_topic,
+                self._gps_velocity_callback,
+                10,
+            )
+        self.gps_heading_subscription = None
+        if GPSHeading is not None:
+            self.gps_heading_subscription = self.create_subscription(
+                GPSHeading,
+                gps_heading_topic,
+                self._gps_heading_callback,
+                10,
+            )
+        self.yolo_3d_bbox_subscription = None
+        if RosString is not None and self._on_yolo_3d_boxes is not None:
+            self.yolo_3d_bbox_subscription = self.create_subscription(
+                RosString,
+                yolo_3d_bbox_topic,
+                self._yolo_3d_bbox_callback,
+                10,
+            )
 
     def _object_callback(self, msg):
         objects = []
@@ -848,6 +1534,93 @@ class PerceptionSubscriber(Node):
                 "points": lane_points,
             })
         self._on_lanes(lanes)
+
+    def _stopbar_callback(self, msg):
+        self._on_stopbar(float(msg.depth))
+
+    def _driveable_polygon_callback(self, msg):
+        points = []
+        for point in msg.polygon.points:
+            points.append((float(point.x), float(point.y), float(point.z)))
+        self._on_driveable_polygon(points)
+
+    def _spatial_map_callback(self, msg):
+        cell_size = float(msg.cell_size)
+        points = []
+        for point in msg.green_points:
+            points.append((float(point.x), float(point.y)))
+        self._on_spatial_map(cell_size, points)
+
+    def _reference_path_callback(self, msg):
+        poses = []
+        for stamped_pose in msg.poses:
+            position = stamped_pose.pose.position
+            orientation = stamped_pose.pose.orientation
+            enu_yaw = yaw_from_quaternion_xyzw(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            )
+            poses.append((float(position.x), float(position.y), float(position.z), enu_yaw))
+        self._on_reference_path(poses)
+
+    def _ground_truth_lane_callback(self, msg):
+        lanes = []
+        vehicle_pose = None
+        for marker in msg.markers:
+            namespace = str(getattr(marker, "ns", ""))
+            if namespace == "vehicle_pose":
+                position = marker.pose.position
+                orientation = marker.pose.orientation
+                vehicle_pose = (
+                    float(position.x),
+                    float(position.y),
+                    float(position.z),
+                    yaw_from_quaternion_xyzw(
+                        float(orientation.x),
+                        float(orientation.y),
+                        float(orientation.z),
+                        float(orientation.w),
+                    ),
+                )
+                continue
+            if not namespace.startswith("lane_"):
+                continue
+            points = []
+            for point in marker.points:
+                points.append((float(point.x), float(point.y), float(point.z)))
+            if points:
+                lanes.append({
+                    "ns": namespace,
+                    "points": points,
+                })
+        self._on_ground_truth_lanes(vehicle_pose, lanes)
+
+    def _gps_velocity_callback(self, msg):
+        self._on_gps_velocity({
+            "time_tag": float(msg.time_tag),
+            "latency": float(msg.latency),
+            "diff_age": float(msg.diff_age),
+            "hor_speed": float(msg.hor_speed),
+            "ver_speed": float(msg.ver_speed),
+            "trk_gnd": float(msg.trk_gnd),
+        })
+
+    def _gps_heading_callback(self, msg):
+        self._on_gps_heading({
+            "available": bool(msg.available),
+            "heading": float(msg.heading),
+            "pitch": float(msg.pitch),
+            "heading_stdev": float(msg.heading_stdev),
+            "pitch_stdev": float(msg.pitch_stdev),
+            "azimuth": float(msg.azimuth),
+        })
+
+    def _yolo_3d_bbox_callback(self, msg):
+        boxes = parse_yolo_3d_bbox_payload(getattr(msg, "data", ""))
+        if self._on_yolo_3d_boxes is not None:
+            self._on_yolo_3d_boxes(boxes)
 
 
 class ROSObjectDetectionBridge:
@@ -950,13 +1723,48 @@ class ROSLaneLineBridge:
 
 
 class ROSPerceptionBridge:
-    def __init__(self, object_topic="/perception/objectdetection", lane_topic="/perception/lane_lines"):
+    def __init__(
+        self,
+        object_topic="/perception/objectdetection",
+        lane_topic="/perception/lane_lines",
+        stopbar_topic="/perception/stopbar",
+        driveable_polygon_topic="/perception/driveable_polygon",
+        spatial_map_topic="/perception/spatial_map",
+        reference_path_topic=REFERENCE_PATH_TOPIC,
+        ground_truth_lane_topic=GROUND_TRUTH_LANE_TOPIC,
+        gps_velocity_topic=GPS_VELOCITY_TOPIC,
+        gps_heading_topic=GPS_HEADING_TOPIC,
+        yolo_3d_bbox_topic=None,
+    ):
+        if yolo_3d_bbox_topic is None:
+            yolo_3d_bbox_topic = read_str_env("WAUTOVANTAGE_YOLO_3D_BBOX_TOPIC", YOLO_3D_BBOX_TOPIC)
         self.enabled = False
         self.node = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._spin_thread = None
         self._latest_object_stamp = 0.0
         self._latest_lane_stamp = 0.0
+        self._latest_stopbar_stamp = 0.0
+        self._latest_driveable_polygon_stamp = 0.0
+        self._latest_spatial_map_stamp = 0.0
+        self._latest_reference_path_stamp = 0.0
+        self._latest_ground_truth_lane_stamp = 0.0
+        self._latest_gps_velocity_stamp = 0.0
+        self._latest_gps_heading_stamp = 0.0
+        self._latest_yolo_3d_bbox_stamp = 0.0
         self._latest_objects: List[Dict[str, float]] = []
         self._latest_lanes: List[Dict[str, object]] = []
+        self._latest_stopbar_depth: Optional[float] = None
+        self._latest_driveable_polygon: List[Tuple[float, float, float]] = []
+        self._latest_spatial_map_cell_size: float = 0.0
+        self._latest_spatial_map_points: List[Tuple[float, float]] = []
+        self._latest_reference_path: List[Tuple[float, ...]] = []
+        self._latest_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
+        self._latest_ground_truth_lanes: List[Dict[str, object]] = []
+        self._latest_gps_velocity: Optional[Dict[str, float]] = None
+        self._latest_gps_heading: Optional[Dict[str, float]] = None
+        self._latest_yolo_3d_boxes: List[Dict[str, object]] = []
 
         if not ROS2_AVAILABLE:
             print("ROS2 Python packages not available; perception bridge disabled")
@@ -968,39 +1776,165 @@ class ROSPerceptionBridge:
             self.node = PerceptionSubscriber(
                 self._store_objects,
                 self._store_lanes,
+                self._store_stopbar,
+                self._store_driveable_polygon,
+                self._store_spatial_map,
+                self._store_reference_path,
+                self._store_ground_truth_lanes,
+                self._store_gps_velocity,
+                self._store_gps_heading,
+                self._store_yolo_3d_boxes,
                 object_topic=object_topic,
                 lane_topic=lane_topic,
+                stopbar_topic=stopbar_topic,
+                driveable_polygon_topic=driveable_polygon_topic,
+                spatial_map_topic=spatial_map_topic,
+                reference_path_topic=reference_path_topic,
+                ground_truth_lane_topic=ground_truth_lane_topic,
+                gps_velocity_topic=gps_velocity_topic,
+                gps_heading_topic=gps_heading_topic,
+                yolo_3d_bbox_topic=yolo_3d_bbox_topic,
             )
             self.enabled = True
-            print(f"Subscribed to ROS2 topics '{object_topic}' and '{lane_topic}'")
+            self._spin_thread = threading.Thread(
+                target=self._spin_loop,
+                name="wautovantage-ros-spin",
+                daemon=True,
+            )
+            self._spin_thread.start()
+            gps_velocity_status = gps_velocity_topic if GPSVelocity is not None else f"{gps_velocity_topic} (message type unavailable)"
+            gps_heading_status = gps_heading_topic if GPSHeading is not None else f"{gps_heading_topic} (message type unavailable)"
+            yolo_3d_bbox_status = yolo_3d_bbox_topic if RosString is not None else f"{yolo_3d_bbox_topic} (std_msgs/String unavailable)"
+            print(
+                f"Subscribed to ROS2 topics '{object_topic}', '{lane_topic}', "
+                f"'{stopbar_topic}', '{driveable_polygon_topic}', '{spatial_map_topic}', "
+                f"'{reference_path_topic}', '{ground_truth_lane_topic}', "
+                f"'{gps_velocity_status}', '{gps_heading_status}', and "
+                f"'{yolo_3d_bbox_status}'"
+            )
         except Exception as exc:
             print(f"Failed to initialize combined perception bridge: {exc}")
             self.enabled = False
 
     def _store_objects(self, objects):
-        self._latest_objects = objects
-        self._latest_object_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_objects = objects
+            self._latest_object_stamp = time.perf_counter()
 
     def _store_lanes(self, lanes):
-        self._latest_lanes = lanes
-        self._latest_lane_stamp = time.perf_counter()
+        with self._lock:
+            self._latest_lanes = lanes
+            self._latest_lane_stamp = time.perf_counter()
+
+    def _store_stopbar(self, depth):
+        with self._lock:
+            self._latest_stopbar_depth = depth
+            self._latest_stopbar_stamp = time.perf_counter()
+
+    def _store_driveable_polygon(self, points):
+        with self._lock:
+            self._latest_driveable_polygon = points
+            self._latest_driveable_polygon_stamp = time.perf_counter()
+
+    def _store_spatial_map(self, cell_size, points):
+        with self._lock:
+            self._latest_spatial_map_cell_size = cell_size
+            self._latest_spatial_map_points = points
+            self._latest_spatial_map_stamp = time.perf_counter()
+
+    def _store_reference_path(self, poses):
+        with self._lock:
+            self._latest_reference_path = poses
+            self._latest_reference_path_stamp = time.perf_counter()
+
+    def _store_ground_truth_lanes(self, vehicle_pose, lanes):
+        with self._lock:
+            self._latest_ground_truth_vehicle_pose = vehicle_pose
+            self._latest_ground_truth_lanes = lanes
+            self._latest_ground_truth_lane_stamp = time.perf_counter()
+
+    def _store_gps_velocity(self, velocity):
+        with self._lock:
+            self._latest_gps_velocity = velocity
+            self._latest_gps_velocity_stamp = time.perf_counter()
+
+    def _store_gps_heading(self, heading):
+        with self._lock:
+            self._latest_gps_heading = heading
+            self._latest_gps_heading_stamp = time.perf_counter()
+
+    def _store_yolo_3d_boxes(self, boxes):
+        with self._lock:
+            self._latest_yolo_3d_boxes = boxes
+            self._latest_yolo_3d_bbox_stamp = time.perf_counter()
+
+    def _spin_loop(self):
+        while not self._stop_event.is_set() and self.enabled and self.node is not None:
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+            except Exception as exc:
+                print(f"ROS2 perception spin_once failed: {exc}")
+                self.enabled = False
+                break
 
     def spin_once(self):
-        if not self.enabled or self.node is None:
-            return
-        try:
-            rclpy.spin_once(self.node, timeout_sec=0.0)
-        except Exception as exc:
-            print(f"ROS2 perception spin_once failed: {exc}")
-            self.enabled = False
+        return
 
     def latest_object_snapshot(self):
-        return self._latest_object_stamp, list(self._latest_objects)
+        with self._lock:
+            return self._latest_object_stamp, list(self._latest_objects)
 
     def latest_lane_snapshot(self):
-        return self._latest_lane_stamp, list(self._latest_lanes)
+        with self._lock:
+            return self._latest_lane_stamp, list(self._latest_lanes)
+
+    def latest_stopbar_snapshot(self):
+        with self._lock:
+            return self._latest_stopbar_stamp, self._latest_stopbar_depth
+
+    def latest_driveable_polygon_snapshot(self):
+        with self._lock:
+            return self._latest_driveable_polygon_stamp, list(self._latest_driveable_polygon)
+
+    def latest_spatial_map_snapshot(self):
+        with self._lock:
+            return (
+                self._latest_spatial_map_stamp,
+                self._latest_spatial_map_cell_size,
+                list(self._latest_spatial_map_points),
+            )
+
+    def latest_reference_path_snapshot(self):
+        with self._lock:
+            return self._latest_reference_path_stamp, list(self._latest_reference_path)
+
+    def latest_ground_truth_lane_snapshot(self):
+        with self._lock:
+            return (
+                self._latest_ground_truth_lane_stamp,
+                self._latest_ground_truth_vehicle_pose,
+                list(self._latest_ground_truth_lanes),
+            )
+
+    def latest_gps_velocity_snapshot(self):
+        with self._lock:
+            velocity = dict(self._latest_gps_velocity) if self._latest_gps_velocity is not None else None
+            return self._latest_gps_velocity_stamp, velocity
+
+    def latest_gps_heading_snapshot(self):
+        with self._lock:
+            heading = dict(self._latest_gps_heading) if self._latest_gps_heading is not None else None
+            return self._latest_gps_heading_stamp, heading
+
+    def latest_yolo_3d_bbox_snapshot(self):
+        with self._lock:
+            return self._latest_yolo_3d_bbox_stamp, [dict(box) for box in self._latest_yolo_3d_boxes]
 
     def close(self):
+        self._stop_event.set()
+        if self._spin_thread is not None and self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=1.0)
+            self._spin_thread = None
         if self.node is not None:
             try:
                 self.node.destroy_node()
@@ -1069,27 +2003,71 @@ class MovingBox:
 
 class Barricade:
     def __init__(self, x, y, z):
-        # Orange color
-        color = (1.0, 0.5, 0.0)
-        # Dimensions for a barricade (approx 0.8m wide, 1.0m high, 0.2m deep)
-        lx, ly, lz = 0.8, 1.0, 0.2
-        v, c = make_box_triangles(lx, ly, lz, color)
+        v, c = make_three_bar_barricade()
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
         self.pos = [x, y, z]
 
 
+def make_three_bar_barricade():
+    verts = []
+    cols = []
+
+    orange = (1.0, 0.38, 0.02)
+    post_gray = (0.16, 0.16, 0.16)
+    foot_gray = (0.12, 0.12, 0.12)
+
+    bar_width = 1.8
+    bar_height = 0.14
+    bar_depth = 0.12
+    for center_y in (0.32, 0.62, 0.92):
+        bar_verts, bar_cols = make_box_triangles(bar_width, bar_height, bar_depth, orange)
+        verts.extend(translate_mesh(bar_verts, 0.0, center_y - bar_height * 0.5, 0.0))
+        cols.extend(bar_cols)
+
+    for post_x in (-0.72, 0.72):
+        post_verts, post_cols = make_box_triangles(0.08, 1.12, 0.09, post_gray)
+        verts.extend(translate_mesh(post_verts, post_x, 0.0, -0.01))
+        cols.extend(post_cols)
+
+    for foot_x in (-0.55, 0.55):
+        foot_verts, foot_cols = make_box_triangles(0.55, 0.08, 0.42, foot_gray)
+        verts.extend(translate_mesh(foot_verts, foot_x, 0.0, 0.0))
+        cols.extend(foot_cols)
+
+    return verts, cols
+
+
 class MovingBarricade:
-    """Orange work zone barricade (trapezoidal prism) that can move like MovingBox."""
-    def __init__(self, x, y, z,
-                 base_len=1.8, base_depth=0.6,
-                 top_len=1.4, top_depth=0.4,
-                 height=1.0,
-                 color=(1.0, 0.5, 0.0), vel=(0.0, 0.0, 0.0)):
-        v, c = make_trapezoid_prism(base_len, base_depth, top_len, top_depth, height, color)
+    """Road-work barricade with three horizontal orange boards."""
+    def __init__(self, x, y, z, vel=(0.0, 0.0, 0.0)):
+        v, c = make_three_bar_barricade()
         self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x,y,z), mat4_identity()))
 
         self.vx, self.vy, self.vz = vel
         self.pos = [x, y, z]
+
+    def update(self, dt):
+        self.pos[0] += self.vx*dt
+        self.pos[1] += self.vy*dt
+        self.pos[2] += self.vz*dt
+        self.mesh.model = mat4_translate(*self.pos)
+
+
+class Barrier:
+    """Concrete-style barrier using the old barricade shape."""
+    def __init__(self, x=0.0, y=0.0, z=0.0, vel=(0.0, 0.0, 0.0)):
+        v, c = make_trapezoid_prism(
+            base_len=1.8,
+            base_depth=0.6,
+            top_len=1.4,
+            top_depth=0.4,
+            height=1.0,
+            color=(0.72, 0.72, 0.68),
+        )
+        self.mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_mul(mat4_translate(x, y, z), mat4_identity()))
+        self.vx, self.vy, self.vz = vel
+        self.pos = [x, y, z]
+
     def update(self, dt):
         self.pos[0] += self.vx*dt
         self.pos[1] += self.vy*dt
@@ -1122,42 +2100,63 @@ class StaticObject:
 # Traffic Light
 # ------------------------------------------------------------
 class TrafficLight:
-    def __init__(self, x=0.0, y=3.0, z=0.0):
-        # Create light housing
-        box_width = 0.5
-        box_height = 1.35
-        box_depth = 0.25
-        box_verts, box_cols = make_box_triangles(box_width, box_height, box_depth, (0.2, 0.2, 0.2))
-        
-        # Create the three lights
-        light_size = 0.25
-        light_depth = 0.1
-        
-        # Calculate even spacing
-        spacing = (box_height - 3*light_size) / 4
-        
-        # Red light (top)
-        red_y = box_height - spacing - light_size
-        red_verts, red_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.1, 0.1))  # Red
-        red_verts = [(x, y + red_y, z + box_depth/2) for x, y, z in red_verts]
-        
-        # Yellow light (middle)
-        yellow_y = box_height - 2*spacing - 2*light_size
-        yellow_verts, yellow_cols = make_box_triangles(light_size, light_size, light_depth, (0.9, 0.9, 0.1))  # Yellow
-        yellow_verts = [(x, y + yellow_y, z + box_depth/2) for x, y, z in yellow_verts]
-        
-        # Green light (bottom)
-        green_y = box_height - 3*spacing - 3*light_size
-        green_verts, green_cols = make_box_triangles(light_size, light_size, light_depth, (0.1, 0.9, 0.1))  # Green
-        green_verts = [(x, y + green_y, z + box_depth/2) for x, y, z in green_verts]
-        
-        # Combine all vertices and colors
-        all_verts = box_verts + red_verts + yellow_verts + green_verts
-        all_cols = box_cols + red_cols + yellow_cols + green_cols
-        
-        # Create the mesh
-        self.mesh = Mesh(all_verts, all_cols, None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+    RED = 1
+    YELLOW = 2
+    GREEN = 3
+
+    def __init__(self, x=0.0, y=3.0, z=0.0, state: int = 255):
         self.pos = [x, y, z]
+        self.state = None
+        self.mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_translate(x, y, z))
+        self.set_state(state)
+
+    def _build_mesh(self):
+        box_width = 0.32
+        box_height = 0.95
+        box_depth = 0.18
+        box_verts, box_cols = make_box_triangles(box_width, box_height, box_depth, (0.04, 0.04, 0.04))
+
+        active_colors = {
+            self.RED: (1.0, 0.03, 0.02),
+            self.YELLOW: (1.0, 0.82, 0.02),
+            self.GREEN: (0.02, 0.9, 0.12),
+        }
+        dim_colors = {
+            self.RED: (0.12, 0.02, 0.02),
+            self.YELLOW: (0.12, 0.10, 0.02),
+            self.GREEN: (0.02, 0.10, 0.03),
+        }
+
+        all_verts = list(box_verts)
+        all_cols = list(box_cols)
+        lens_radius = 0.095
+        lens_depth = 0.035
+        front_z = (box_depth * 0.5) + (lens_depth * 0.5) + 0.004
+        lens_positions = (
+            (self.RED, 0.73),
+            (self.YELLOW, 0.48),
+            (self.GREEN, 0.23),
+        )
+        for state, center_y in lens_positions:
+            color = active_colors[state] if self.state == state else dim_colors[state]
+            lens_verts, lens_cols = make_circular_lens(lens_radius, lens_depth, color)
+            all_verts.extend(translate_mesh(lens_verts, 0.0, center_y, front_z))
+            all_cols.extend(lens_cols)
+
+        self.mesh.verts = all_verts
+        self.mesh.cols = all_cols
+        if hasattr(self.mesh, "_gpu"):
+            delattr(self.mesh, "_gpu")
+
+    def set_state(self, state: int):
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            state = 255
+        if state == self.state:
+            return
+        self.state = state if state in (self.RED, self.YELLOW, self.GREEN) else 255
+        self._build_mesh()
 
 
     def update(self, dt: float):
@@ -1175,38 +2174,34 @@ class StreetSign:
         self.y_adjust = y_adjust
         self.scale = scale
         thickness = 0.02
-        width, height = 0.78, 0.92
-        border_inset = 0.06
-        corner_radius = 0.12
-
-        border_verts, border_cols = make_rounded_rect_sign(
-            width,
-            height,
-            thickness,
-            color=(0.05, 0.05, 0.05),
-            radius=corner_radius,
-        )
-        face_verts, face_cols = make_rounded_rect_sign(
-            width - (border_inset * 2.0),
-            height - (border_inset * 2.0),
-            thickness * 0.7,
-            color=(1.0, 1.0, 1.0),
-            radius=max(0.04, corner_radius - border_inset * 0.65),
-        )
-        self.pole_mesh = Mesh(border_verts, border_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.support_offset_z = 0.085 * scale
         self.panel_offset = (0.0, 1.55 + self.y_adjust, 0.0)
-        self.panel_mesh = Mesh(face_verts, face_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+        sign_parts = make_street_sign_parts(kind, thickness, scale=scale)
+        self.panel_meshes = [
+            Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity())
+            for verts, cols in sign_parts
+        ]
+        for index, mesh in enumerate(self.panel_meshes):
+            mesh.layer_offset = 0.0 if index == 0 else SIGN_OVERLAY_EGO_FACE_OFFSET_M - ((index - 1) * SIGN_OVERLAY_LAYER_STEP_M)
+        self.panel_mesh = self.panel_meshes[0] if self.panel_meshes else None
+        sign_bottom = min((z for verts, _cols in sign_parts for _x, _y, z in verts), default=-0.45 * scale)
+        self.pole_height = max(0.15, self.panel_offset[1] + sign_bottom - (0.035 * scale))
+        pole_verts, pole_cols = make_box_triangles(0.08 * scale, self.pole_height, 0.08 * scale, (0.18, 0.18, 0.18))
+        self.pole_mesh = Mesh(pole_verts, pole_cols, None, None, gl.GL_TRIANGLES, mat4_identity())
 
 
     def update(self, dt: float):
         ox, oy, oz = self.panel_offset
-        M = mat4_mul(mat4_translate(*self.pos), mat4_translate(ox, oy, oz))
+        base_M = mat4_translate(*self.pos)
+        pole_M = mat4_mul(base_M, mat4_translate(0.0, 0.0, self.support_offset_z))
+        self.pole_mesh.model = pole_M
+
+        M = mat4_mul(base_M, mat4_translate(ox, oy, oz))
         M = mat4_mul(M, mat4_rotate_x(math.radians(90.0)))
         if getattr(self, 'yaw', 0.0) != 0.0:
             M = mat4_mul(M, mat4_rotate_y(self.yaw))
-        self.pole_mesh.model = M
-        inner = mat4_mul(M, mat4_translate(0.0, 0.011, 0.0))
-        self.panel_mesh.model = inner
+        for mesh in self.panel_meshes:
+            mesh.model = mat4_mul(M, mat4_translate(0.0, mesh.layer_offset, 0.0))
 
 
 class DetectedEntity:
@@ -1214,6 +2209,12 @@ class DetectedEntity:
         self.object_id = int(detection["object_id"])
         self.obj_class = int(detection["obj_class"])
         self.custom_classification = int(detection.get("custom_classification", 0))
+        self.reported_coords = (
+            float(detection.get("x", 0.0)),
+            float(detection.get("y", 0.0)),
+            float(detection.get("z", 0.0)),
+        )
+        self.reported_height = float(detection.get("height", 0.0))
         self.actor = actor
         self.actor_key = actor_key
         self.local_pose = [0.0, 0.0, 0.0]
@@ -1237,6 +2238,14 @@ class DetectedEntity:
             self.actor_key = actor_key
         self.obj_class = int(detection["obj_class"])
         self.custom_classification = int(detection.get("custom_classification", 0))
+        self.reported_coords = (
+            float(detection.get("x", 0.0)),
+            float(detection.get("y", 0.0)),
+            float(detection.get("z", 0.0)),
+        )
+        self.reported_height = float(detection.get("height", 0.0))
+        if isinstance(self.actor, TrafficLight):
+            self.actor.set_state(self.custom_classification)
         self.last_seen = time.perf_counter()
 
     def set_local_pose(self, x: float, y: float, z: float, camera_origin_local, ego_motion_local, ego_delta_yaw: float, detection_dt: Optional[float]):
@@ -1244,16 +2253,9 @@ class DetectedEntity:
         filtered_pose = self._filter_local_pose(raw_pose, detection_dt)
         motion_pose = self._tracked_local_pose if self._tracked_local_pose is not None else filtered_pose
         self._update_motion_heading(motion_pose, ego_motion_local, ego_delta_yaw, detection_dt)
-        resolved_yaw = self._refresh_render_yaw()
-
-        if self.obj_class in VEHICLE_CENTER_CORRECTION_CLASSES:
-            new_pose = self._vehicle_center_from_nearest_point(filtered_pose, camera_origin_local, motion_yaw=resolved_yaw)
-        else:
-            new_pose = filtered_pose
-
-        self.target_local_pose = new_pose
+        self.target_local_pose = filtered_pose
         if not self._pose_initialized:
-            self.local_pose = list(new_pose)
+            self.local_pose = list(filtered_pose)
             self._pose_initialized = True
         self._raw_local_pose = list(raw_pose)
 
@@ -1344,31 +2346,6 @@ class DetectedEntity:
         self._render_yaw = lerp_angle(self._render_yaw, target_yaw, blend_alpha)
         return self._render_yaw
 
-    def _vehicle_center_from_nearest_point(self, raw_pose, camera_origin_local, motion_yaw: Optional[float] = None):
-        motion_yaw = self._motion_yaw if motion_yaw is None else motion_yaw
-        if motion_yaw is None:
-            return raw_pose
-
-        cam_x, _cam_y, cam_z = camera_origin_local
-        los_x, los_z = normalize_vec2(raw_pose[0] - cam_x, raw_pose[2] - cam_z)
-        if los_x == 0.0 and los_z == 0.0:
-            return raw_pose
-
-        fwd_x = math.sin(motion_yaw)
-        fwd_z = -math.cos(motion_yaw)
-        right_x = math.cos(motion_yaw)
-        right_z = math.sin(motion_yaw)
-
-        longitudinal = abs((los_x * fwd_x) + (los_z * fwd_z))
-        lateral = abs((los_x * right_x) + (los_z * right_z))
-        shift = (VEHICLE_CENTER_HALF_LENGTH_M * longitudinal) + (VEHICLE_CENTER_HALF_WIDTH_M * lateral)
-
-        return [
-            raw_pose[0] + (los_x * shift),
-            raw_pose[1],
-            raw_pose[2] + (los_z * shift),
-        ]
-
     def apply_anchor(self, anchor_model):
         actor = self.actor
         if actor is None:
@@ -1382,13 +2359,14 @@ class DetectedEntity:
 
         if isinstance(actor, StreetSign):
             world_model = mat4_mul(anchor_model, local_model)
-            actor.pole_mesh.model = world_model
+            actor.pole_mesh.model = mat4_mul(world_model, mat4_translate(0.0, 0.0, actor.support_offset_z))
             ox, oy, oz = actor.panel_offset
             panel_model = mat4_mul(world_model, mat4_translate(ox, oy, oz))
             panel_model = mat4_mul(panel_model, mat4_rotate_x(math.radians(90.0)))
             if getattr(actor, "yaw", 0.0) != 0.0:
                 panel_model = mat4_mul(panel_model, mat4_rotate_y(actor.yaw))
-            actor.panel_mesh.model = panel_model
+            for mesh in actor.panel_meshes:
+                mesh.model = mat4_mul(panel_model, mat4_translate(0.0, mesh.layer_offset, 0.0))
             return
 
         if isinstance(actor, TrafficLight):
@@ -1397,9 +2375,6 @@ class DetectedEntity:
             return
 
         if hasattr(actor, "mesh"):
-            resolved_yaw = self._refresh_render_yaw()
-            if self.obj_class in MOTION_HEADING_CLASSES and resolved_yaw is not None:
-                local_model = mat4_mul(local_model, mat4_rotate_y(resolved_yaw))
             world_model = mat4_mul(anchor_model, local_model)
             actor.mesh.model = world_model
         elif isinstance(actor, Mesh):
@@ -1442,7 +2417,8 @@ class DetectedEntity:
 
         if isinstance(actor, StreetSign):
             renderer.draw_mesh(actor.pole_mesh, pv)
-            renderer.draw_mesh(actor.panel_mesh, pv)
+            for mesh in actor.panel_meshes:
+                renderer.draw_mesh(mesh, pv)
             return
 
         if isinstance(actor, TrafficLight):
@@ -1455,6 +2431,17 @@ class DetectedEntity:
 
         renderer.draw_mesh(actor.mesh, pv)
 
+    def label_world_point(self, anchor_model, default_height: float):
+        height = self.reported_height
+        if not isinstance(height, (int, float)) or not math.isfinite(height) or height <= 0.01 or height >= 1000.0:
+            height = default_height
+        label_y = self.local_pose[1] + max(0.5, height) + 0.22
+        return mat4_transform_point(anchor_model, self.local_pose[0], label_y, self.local_pose[2])[:3]
+
+    def label_text(self):
+        x, y, z = self.reported_coords
+        return f"{self.object_id}: ({x:.1f}, {y:.1f}, {z:.1f})"
+
 
 # ------------------------------------------------------------
 # Static-VBO Renderer (color + textured)
@@ -1462,55 +2449,113 @@ class DetectedEntity:
 class Renderer:
     def __init__(self):
         self.prog_color = ShaderProgram(Shader(VERT_COLOR, 'vertex'), Shader(FRAG_COLOR, 'fragment'))
+        self.prog_color_inst = ShaderProgram(Shader(VERT_COLOR_INSTANCED, 'vertex'), Shader(FRAG_COLOR, 'fragment'))
         self.prog_tex   = ShaderProgram(Shader(VERT_TEX, 'vertex'),   Shader(FRAG_TEX,   'fragment'))
         self._bound_kind = None
         self._bound_texture_id = None
         self._bound_vao = None
+        self._instance_vbo = None
+        self._instance_capacity = 0
 
     def begin_frame(self):
         self._bound_kind = None
         self._bound_texture_id = None
         self._bound_vao = None
 
-    def _build_gpu_color(self, mesh: Mesh):
+    def _color_array(self, mesh: Mesh):
         n = len(mesh.verts)
         inter = []
-        # Detect if verts is flat list or list of tuples
         is_flat = n > 0 and isinstance(mesh.verts[0], (int, float))
-        
+
         if is_flat:
-            # Flat list: iterate in steps of 3
             vertex_count = n // 3
             for i in range(0, n, 3):
                 x = mesh.verts[i]
-                y = mesh.verts[i+1]
-                z = mesh.verts[i+2]
-                r, g, b = mesh.cols[i//3] if mesh.cols else (1.0, 1.0, 1.0)
-                inter.extend((x, y, z, r, g, b))
+                y = mesh.verts[i + 1]
+                z = mesh.verts[i + 2]
+                color = mesh.cols[i // 3] if mesh.cols else (1.0, 1.0, 1.0)
+                r, g, b = color[:3]
+                a = color[3] if len(color) >= 4 else 1.0
+                inter.extend((x, y, z, r, g, b, a))
         else:
-            # List of tuples
             vertex_count = n
             for i in range(n):
                 x, y, z = mesh.verts[i]
-                r, g, b = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
-                inter.extend((x, y, z, r, g, b))
-        
-        arr = (gl.GLfloat * (6 * vertex_count))(*inter)
+                color = mesh.cols[i] if mesh.cols else (1.0, 1.0, 1.0)
+                r, g, b = color[:3]
+                a = color[3] if len(color) >= 4 else 1.0
+                inter.extend((x, y, z, r, g, b, a))
 
+        arr = (gl.GLfloat * max(1, 7 * vertex_count))(*inter) if vertex_count else None
+        return arr, vertex_count
+
+    def _next_capacity(self, needed: int, current: int = 0) -> int:
+        capacity = max(1, current)
+        while capacity < needed:
+            capacity *= 2
+        return capacity
+
+    def _build_gpu_color(self, mesh: Mesh, usage=None, capacity_vertices: Optional[int] = None):
+        arr, vertex_count = self._color_array(mesh)
+        usage = usage if usage is not None else gl.GL_STATIC_DRAW
+        capacity = max(vertex_count, capacity_vertices or vertex_count)
         vao = gl.GLuint()
         vbo = gl.GLuint()
         gl.glGenVertexArrays(1, ctypes.byref(vao))
         gl.glGenBuffers(1, ctypes.byref(vbo))
         gl.glBindVertexArray(vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, gl.GL_STATIC_DRAW)
+        if capacity > vertex_count:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 7 * capacity * ctypes.sizeof(gl.GLfloat), None, usage)
+            if arr is not None:
+                gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
+        elif arr is not None:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, usage)
+        else:
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 0, None, usage)
 
-        stride = 6 * ctypes.sizeof(gl.GLfloat)
+        stride = 7 * ctypes.sizeof(gl.GLfloat)
         gl.glEnableVertexAttribArray(0)
         gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(0))
         gl.glEnableVertexAttribArray(1)
-        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
+        mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
+        mesh._gpu_capacity = capacity
+        mesh._gpu_usage = usage
+
+    def update_color_mesh(self, mesh: Mesh, verts, cols, mode=None):
+        mesh.verts = verts
+        mesh.cols = cols
+        mesh.uvs = None
+        mesh.texture_id = None
+        if mode is not None:
+            mesh.mode = mode
+
+        arr, vertex_count = self._color_array(mesh)
+        if vertex_count == 0:
+            if hasattr(mesh, "_gpu"):
+                vao, vbo, _n, _mode, _kind = mesh._gpu
+                mesh._gpu = (vao, vbo, 0, mesh.mode, 'color')
+            return
+
+        if not hasattr(mesh, "_gpu"):
+            capacity = self._next_capacity(vertex_count)
+            self._build_gpu_color(mesh, usage=gl.GL_DYNAMIC_DRAW, capacity_vertices=capacity)
+            return
+
+        vao, vbo, _n, _mode, kind = mesh._gpu
+        if kind != 'color':
+            self._build_gpu_color(mesh, usage=gl.GL_DYNAMIC_DRAW, capacity_vertices=self._next_capacity(vertex_count))
+            return
+
+        capacity = getattr(mesh, "_gpu_capacity", 0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        if vertex_count > capacity:
+            capacity = self._next_capacity(vertex_count, capacity)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, 7 * capacity * ctypes.sizeof(gl.GLfloat), None, gl.GL_DYNAMIC_DRAW)
+            mesh._gpu_capacity = capacity
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'color')
 
     def _build_gpu_tex(self, mesh: Mesh):
@@ -1576,8 +2621,37 @@ class Renderer:
         gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, ctypes.c_void_p(3*ctypes.sizeof(gl.GLfloat)))
 
         mesh._gpu = (vao, vbo, vertex_count, mesh.mode, 'tex')
+        mesh._gpu_capacity = vertex_count
+        mesh._gpu_usage = gl.GL_STATIC_DRAW
 
-    def draw_mesh(self, mesh: Mesh, proj_view):
+    def _ensure_instance_buffer(self, count: int):
+        if count <= self._instance_capacity and self._instance_vbo is not None:
+            return
+        self._instance_capacity = self._next_capacity(count, self._instance_capacity)
+        if self._instance_vbo is None:
+            self._instance_vbo = gl.GLuint()
+            gl.glGenBuffers(1, ctypes.byref(self._instance_vbo))
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        gl.glBufferData(
+            gl.GL_ARRAY_BUFFER,
+            16 * self._instance_capacity * ctypes.sizeof(gl.GLfloat),
+            None,
+            gl.GL_DYNAMIC_DRAW,
+        )
+
+    def instance_batch_key(self, mesh: Mesh):
+        if mesh.uvs is not None or mesh.texture_id is not None:
+            return None
+        if not hasattr(mesh, "_gpu"):
+            self._build_gpu_color(mesh)
+        vao, _vbo, n, mode, kind = mesh._gpu
+        if kind != 'color' or n <= 0:
+            return None
+        return (vao.value, n, mode)
+
+    def draw_mesh(self, mesh: Mesh, proj_view, alpha: float = 1.0):
+        if not mesh.verts:
+            return
         if not hasattr(mesh, "_gpu"):
             if mesh.uvs is not None and mesh.texture_id is not None:
                 self._build_gpu_tex(mesh)
@@ -1585,6 +2659,8 @@ class Renderer:
                 self._build_gpu_color(mesh)
 
         vao, _vbo, n, mode, kind = mesh._gpu
+        if n <= 0:
+            return
         mvp = mat4_mul(proj_view, mesh.model)
 
         if kind == 'tex':
@@ -1603,11 +2679,67 @@ class Renderer:
                 self._bound_kind = 'color'
                 self._bound_texture_id = None
             self.prog_color['u_mvp'] = mvp
+            self.prog_color['u_alpha'] = alpha
 
         if self._bound_vao != vao.value:
             gl.glBindVertexArray(vao)
             self._bound_vao = vao.value
         gl.glDrawArrays(mode, 0, n)
+
+    def draw_mesh_instances(self, mesh: Mesh, proj_view, models, alpha: float = 1.0):
+        if not models:
+            return
+        if len(models) == 1 or not hasattr(gl, "glDrawArraysInstanced"):
+            original_model = mesh.model
+            for model in models:
+                mesh.model = model
+                self.draw_mesh(mesh, proj_view, alpha=alpha)
+            mesh.model = original_model
+            return
+
+        if not hasattr(mesh, "_gpu"):
+            self._build_gpu_color(mesh)
+        vao, _vbo, n, mode, kind = mesh._gpu
+        if kind != 'color' or n <= 0:
+            original_model = mesh.model
+            for model in models:
+                mesh.model = model
+                self.draw_mesh(mesh, proj_view, alpha=alpha)
+            mesh.model = original_model
+            return
+
+        self._ensure_instance_buffer(len(models))
+        flat = []
+        for model in models:
+            flat.extend(model)
+        arr = (gl.GLfloat * len(flat))(*flat)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, ctypes.sizeof(arr), arr)
+
+        if self._bound_kind != 'color_inst':
+            self.prog_color_inst.use()
+            self._bound_kind = 'color_inst'
+            self._bound_texture_id = None
+        self.prog_color_inst['u_proj_view'] = proj_view
+        self.prog_color_inst['u_alpha'] = alpha
+
+        gl.glBindVertexArray(vao)
+        self._bound_vao = vao.value
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_vbo)
+        stride = 16 * ctypes.sizeof(gl.GLfloat)
+        for i in range(4):
+            attrib = 2 + i
+            gl.glEnableVertexAttribArray(attrib)
+            gl.glVertexAttribPointer(
+                attrib,
+                4,
+                gl.GL_FLOAT,
+                gl.GL_FALSE,
+                stride,
+                ctypes.c_void_p(i * 4 * ctypes.sizeof(gl.GLfloat)),
+            )
+            gl.glVertexAttribDivisor(attrib, 1)
+        gl.glDrawArraysInstanced(mode, 0, n, len(models))
 
     def warm_mesh(self, mesh: Mesh):
         if hasattr(mesh, "_gpu"):
@@ -1643,7 +2775,7 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 
 
 class AVHMI(pyglet.window.Window):
-    def __init__(self, width=1280, height=720, fps=60):
+    def __init__(self, width=640, height=360, fps=60):
         cfg = gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3)
         super().__init__(width=width, height=height, caption="HMI 3D", resizable=True, config=cfg)
         self.fps = fps
@@ -1653,10 +2785,25 @@ class AVHMI(pyglet.window.Window):
 
         self.keys = key.KeyStateHandler()
         self.push_handlers(self.keys)
-        self.set_exclusive_mouse(False)
-        self.mouse_captured = False
         self.hud = pyglet.text.Label("", font_name="Roboto", font_size=12, x=10, y=10)
-        self.camera_origin_local = (0.0, 1.35, 0.0)
+        self.coord_label = pyglet.text.Label(
+            "",
+            font_name="Roboto",
+            font_size=10,
+            x=0,
+            y=0,
+            anchor_x="center",
+            anchor_y="bottom",
+            color=(235, 245, 255, 230),
+        )
+        self.show_labels = read_bool_env("WAUTOVANTAGE_SHOW_LABELS", False)
+        self.profiler = FrameProfiler(
+            read_bool_env("WAUTOVANTAGE_PROFILE", False),
+            read_float_env("WAUTOVANTAGE_PROFILE_INTERVAL", 2.0, minimum=0.25),
+        )
+        geometry_hz = read_float_env("WAUTOVANTAGE_PERCEPTION_GEOMETRY_MAX_HZ", 20.0, minimum=1.0)
+        self._perception_geometry_min_interval = 1.0 / geometry_hz
+        self.camera_origin_local = (0.0, 0.0, 0.0)
         self.detected_entities: Dict[int, DetectedEntity] = {}
         self.detected_mesh_templates: Dict[str, Mesh] = {}
         self._last_detection_stamp = 0.0
@@ -1667,7 +2814,59 @@ class AVHMI(pyglet.window.Window):
         self._ego_speed_mph_history = []
         self.perception_bridge = ROSPerceptionBridge()
         self._last_lane_stamp = 0.0
+        self._pending_lane_stamp = 0.0
+        self._pending_lanes: List[Dict[str, object]] = []
+        self._last_lane_geometry_sync_time = 0.0
         self.lane_meshes: List[Mesh] = []
+        self._lane_dynamic_meshes: Dict[Tuple[float, float, float], Mesh] = {}
+        self.stopbar_mesh: Optional[Mesh] = None
+        self.stopbar_distance: Optional[float] = None
+        self._last_stopbar_stamp = 0.0
+        self.driveable_polygon_mesh: Optional[Mesh] = None
+        self._last_driveable_polygon_stamp = 0.0
+        self._pending_driveable_polygon_stamp = 0.0
+        self._pending_driveable_polygon: List[Tuple[float, float, float]] = []
+        self._last_driveable_polygon_geometry_sync_time = 0.0
+        self._driveable_polygon_visible = False
+        self.show_spatial_map = read_bool_env("WAUTOVANTAGE_SHOW_SPATIAL_MAP", True)
+        self.spatial_map_mesh: Optional[Mesh] = None
+        self._last_spatial_map_stamp = 0.0
+        self._pending_spatial_map_stamp = 0.0
+        self._pending_spatial_map_cell_size = 0.0
+        self._pending_spatial_map_points: List[Tuple[float, float]] = []
+        self._last_spatial_map_geometry_sync_time = 0.0
+        self._spatial_map_visible = False
+        self._latest_spatial_map_cell_count = 0
+        self.show_yolo_3d_boxes = read_bool_env("WAUTOVANTAGE_SHOW_YOLO_3D_BOXES", True)
+        self.yolo_3d_bbox_mesh: Optional[Mesh] = None
+        self._last_yolo_3d_bbox_stamp = 0.0
+        self._pending_yolo_3d_bbox_stamp = 0.0
+        self._pending_yolo_3d_boxes: List[Dict[str, object]] = []
+        self._last_yolo_3d_bbox_geometry_sync_time = 0.0
+        self._yolo_3d_bbox_visible = False
+        self._latest_yolo_3d_bbox_count = 0
+        self.reference_path_mesh: Optional[Mesh] = None
+        self._last_reference_path_stamp = 0.0
+        self._pending_reference_path_stamp = 0.0
+        self._pending_reference_path: List[Tuple[float, ...]] = []
+        self._last_reference_path_geometry_sync_time = 0.0
+        self._reference_path_visible = False
+        self._latest_reference_path_count = 0
+        self._reference_path_anchor_model: Optional[List[float]] = None
+        self.ground_truth_lane_mesh: Optional[Mesh] = None
+        self._last_ground_truth_lane_stamp = 0.0
+        self._pending_ground_truth_lane_stamp = 0.0
+        self._pending_ground_truth_vehicle_pose: Optional[Tuple[float, float, float, float]] = None
+        self._pending_ground_truth_lanes: List[Dict[str, object]] = []
+        self._last_ground_truth_lane_geometry_sync_time = 0.0
+        self._ground_truth_lane_visible = False
+        self._latest_ground_truth_lane_count = 0
+        self._last_gps_velocity_stamp = 0.0
+        self._last_gps_heading_stamp = 0.0
+        self._gps_speed_mps = 0.0
+        self._gps_track_rad: Optional[float] = None
+        self._gps_heading_rad: Optional[float] = None
+        self._gps_world_velocity_mps = [0.0, 0.0, 0.0]
         self._lane_orientation_segments: List[Dict[str, object]] = []
         self._lane_orientation_cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         self._latest_lane_count = 0
@@ -1675,6 +2874,7 @@ class AVHMI(pyglet.window.Window):
         self._projection_matrix = perspective(60.0, max(1e-6, width / float(height)), 0.1, 500.0)
         self._projection_dirty = False
         self.detected_car_color = (0.55, 0.57, 0.60)
+        self.brake_on = False
 
         self.ego = Ego()
         car_obj_path = asset_path("WAutoCar.obj")
@@ -1767,14 +2967,11 @@ class AVHMI(pyglet.window.Window):
         # Rolling state
         self._wheel_roll = 0.0
 
-        # Barricade Model
-        bl, bd = 1.8*0.85, 0.6*0.85
-        tl, td = 1.4*0.85, 0.4*0.85
-        h      = 1.0*0.85
+        # Demo barricade/barrier models. These get disabled when live ROS detections are shown.
         bx, by, bz = 3.0 + 1.2, 0.0, -10.0
-        self.obstacles: List[MovingBarricade] = [
-            MovingBarricade(bx, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(1.0, 0.5, 0.0)),
-            MovingBarricade(bx + 2.0, by, bz, base_len=bl, base_depth=bd, top_len=tl, top_depth=td, height=h, color=(0.6, 0.6, 0.6))
+        self.obstacles: List[object] = [
+            MovingBarricade(bx, by, bz),
+            Barrier(bx + 2.0, by, bz),
         ]
         self.show_obstacles = True
 
@@ -1941,7 +3138,7 @@ class AVHMI(pyglet.window.Window):
                 model_h = max(1e-6, cymax - cymin)
                 desired_h = 1.4
                 s = desired_h / model_h
-                cpos_scaled = center_ground_mesh_vertices([(x*s, (y - cymin)*s, z*s) for (x, y, z) in cpos])
+                cpos_scaled = rotate_mesh_y_180(center_ground_mesh_vertices([(x*s, (y - cymin)*s, z*s) for (x, y, z) in cpos]))
                 gray_cols = recolor_car_mesh_colors(cpos_scaled, ccol, self.detected_car_color)
                 car_mesh = Mesh(cpos_scaled, gray_cols, None, None, gl.GL_TRIANGLES, mat4_translate(-2.0, 0.0, -8.0))
                 
@@ -1981,7 +3178,7 @@ class AVHMI(pyglet.window.Window):
                 cx = (cxmin + cxmax) * 0.5
                 cz = (czmin + czmax) * 0.5
                 
-                cpos_scaled = [((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cpos]
+                cpos_scaled = rotate_mesh_y_180([((x - cx)*s, (y - cymin)*s, (z - cz)*s) for (x, y, z) in cpos])
 
                 # Position it next to the truck
                 car_x, car_y, car_z = -7, 0.0, -8.0
@@ -2030,18 +3227,20 @@ class AVHMI(pyglet.window.Window):
         except Exception as e:
             print(f"WARNING: failed to build street signs: {e}")
 
-        gv, gc = make_grid_tile(self.tile_size, self.tile_step)
-        self.grid_base = Mesh(gv, gc, None, None, gl.GL_LINES, mat4_identity()) 
+        self.grid_tile_verts, self.grid_tile_cols = make_grid_tile(self.tile_size, self.tile_step)
+        self.grid_mesh = Mesh([], [], None, None, gl.GL_LINES, mat4_identity())
         self.grid_tiles = {}
+        self._grid_center_tile = None
         self.lane_meshes = [Mesh(*make_polyline(pts), None, None, gl.GL_LINES, mat4_identity()) for pts in lane_pts]
 
-        # Camera (initialize behind the car)
-        self.cam_yawoff = math.pi / 2.0
-        self.cam_pitch  = math.radians(48.0)
-        self.cam_dist   = 6.5
-        self.cam_height = 2.5
+        # Third-person chase camera, locked behind the ego vehicle.
+        self.chase_cam_dist = 8.5
+        self.chase_cam_height = 3.2
+        self.chase_cam_target_height = 1.25
+        self.chase_cam_lookahead = 7.0
 
         self.renderer = Renderer()
+        self._stream_grid()
         self._warm_detected_templates()
         self.last_time = time.perf_counter()
         self._disable_demo_detection_actors()
@@ -2070,19 +3269,21 @@ class AVHMI(pyglet.window.Window):
         ix = int(math.floor(self.ego.pos[0] / self.tile_size))
         iz = int(math.floor(self.ego.pos[2] / self.tile_size))
 
-        needed = set()
+        center = (ix, iz)
+        if center == self._grid_center_tile:
+            return
+
+        verts = []
+        cols = []
         for i in range(ix - self.tile_radius, ix + self.tile_radius + 1):
             for j in range(iz - self.tile_radius, iz + self.tile_radius + 1):
-                needed.add((i, j))
-                if (i, j) not in self.grid_tiles:
-                    mx = i * self.tile_size
-                    mz = j * self.tile_size
-                    self.grid_tiles[(i, j)] = mat4_translate(mx, 0.0, mz)
+                mx = i * self.tile_size
+                mz = j * self.tile_size
+                verts.extend(translate_mesh(self.grid_tile_verts, mx, 0.0, mz))
+                cols.extend(self.grid_tile_cols)
 
-        # Drop tiles that are far behind
-        to_delete = [key for key in self.grid_tiles.keys() if key not in needed]
-        for key in to_delete:
-            del self.grid_tiles[key]
+        self.renderer.update_color_mesh(self.grid_mesh, verts, cols, gl.GL_LINES)
+        self._grid_center_tile = center
 
     def _disable_demo_detection_actors(self):
         self.show_obstacles = False
@@ -2115,6 +3316,8 @@ class AVHMI(pyglet.window.Window):
             14: 1.5,
             15: 3.5,
             16: 1.8,
+            18: 1.0,
+            19: 1.0,
         }.get(obj_class, 1.0)
 
     def _valid_detection(self, detection: Dict[str, float]) -> bool:
@@ -2245,7 +3448,7 @@ class AVHMI(pyglet.window.Window):
             entity.snap_to_lane_yaw(self._nearest_lane_snap_yaw(pose, entity))
 
     def _sync_lane_lines(self, lanes: List[Dict[str, object]]):
-        meshes = []
+        lane_groups: Dict[Tuple[float, float, float], Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]] = {}
         segments = []
         rendered_lane_count = 0
 
@@ -2261,12 +3464,15 @@ class AVHMI(pyglet.window.Window):
                 continue
 
             render_points = smooth_polyline(lane_points, passes=LANE_LINE_SMOOTHING_PASSES)
+            color = self._lane_color_for_type(line_type)
             verts, cols = make_polyline_ribbon(
                 render_points,
                 width=LANE_LINE_WIDTH_M,
-                color=self._lane_color_for_type(line_type),
+                color=color,
             )
-            meshes.append(Mesh(verts, cols, None, None, gl.GL_TRIANGLES, mat4_identity()))
+            group_verts, group_cols = lane_groups.setdefault(color, ([], []))
+            group_verts.extend(verts)
+            group_cols.extend(cols)
             orientation_points = resample_polyline_for_orientation(render_points, LANE_ORIENTATION_MIN_SEGMENT_M)
             for idx in range(len(orientation_points) - 1):
                 start = orientation_points[idx]
@@ -2284,9 +3490,15 @@ class AVHMI(pyglet.window.Window):
                 })
             rendered_lane_count += 1
 
-        self.lane_meshes = meshes
-        for mesh in self.lane_meshes:
-            self.renderer.warm_mesh(mesh)
+        active_meshes = []
+        for color, (verts, cols) in lane_groups.items():
+            mesh = self._lane_dynamic_meshes.get(color)
+            if mesh is None:
+                mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+                self._lane_dynamic_meshes[color] = mesh
+            self.renderer.update_color_mesh(mesh, verts, cols, gl.GL_TRIANGLES)
+            active_meshes.append(mesh)
+        self.lane_meshes = active_meshes
         self._lane_orientation_segments = segments
         cells: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         for segment in segments:
@@ -2299,6 +3511,363 @@ class AVHMI(pyglet.window.Window):
         if self._should_update_orientation_this_frame():
             self._snap_vehicle_orientations_to_lanes()
 
+    def _sync_stopbar(self, depth: Optional[float]):
+        if depth is None:
+            self.stopbar_distance = None
+            return
+
+        try:
+            distance = float(depth)
+        except (TypeError, ValueError):
+            self.stopbar_distance = None
+            return
+
+        if not math.isfinite(distance) or distance <= 0.1 or distance >= 9000.0:
+            self.stopbar_distance = None
+            return
+
+        verts, cols = make_ground_rect(
+            STOPBAR_WIDTH_M,
+            STOPBAR_THICKNESS_M,
+            -distance,
+            STOPBAR_RENDER_LIFT_M,
+            color=(1.0, 1.0, 1.0),
+        )
+        if self.stopbar_mesh is None:
+            self.stopbar_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.stopbar_mesh, verts, cols, gl.GL_TRIANGLES)
+        self.stopbar_distance = distance
+
+    def _sync_driveable_polygon(self, points: List[Tuple[float, float, float]]):
+        local_points = []
+        for point in points:
+            if len(point) < 3:
+                continue
+            forward = float(point[0])
+            left = float(point[1])
+            if not all(math.isfinite(v) and abs(v) < 9000.0 for v in (forward, left)):
+                continue
+            local_pose = self._sensor_depth_to_local_pose(forward, left, 0.0, lateral_offset=0.0)
+            local_pose[1] = DRIVEABLE_POLYGON_RENDER_LIFT_M
+            local_points.append(tuple(local_pose))
+
+        verts, cols = triangulate_polygon(local_points, color=(0.46, 0.46, 0.46))
+        if not verts:
+            self._driveable_polygon_visible = False
+            return
+
+        if self.driveable_polygon_mesh is None:
+            self.driveable_polygon_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.driveable_polygon_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._driveable_polygon_visible = True
+
+    def _sync_spatial_map(self, cell_size: float, points: List[Tuple[float, float]]):
+        if not math.isfinite(cell_size) or cell_size <= 1e-3:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
+            return
+
+        half = cell_size * 0.5
+        lift = SPATIAL_MAP_RENDER_LIFT_M
+        color = SPATIAL_MAP_CELL_COLOR
+        max_range_sq = SPATIAL_MAP_MAX_RANGE_M * SPATIAL_MAP_MAX_RANGE_M
+
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+
+        for point in points:
+            forward = float(point[0])
+            left = float(point[1])
+            if not (math.isfinite(forward) and math.isfinite(left)):
+                continue
+            if forward * forward + left * left > max_range_sq:
+                continue
+
+            local_pose = self._sensor_depth_to_local_pose(forward, left, 0.0, lateral_offset=0.0)
+            cx = local_pose[0]
+            cz = local_pose[2]
+            x0, x1 = cx - half, cx + half
+            z0, z1 = cz - half, cz + half
+            verts.extend((
+                (x0, lift, z0), (x1, lift, z0), (x1, lift, z1),
+                (x0, lift, z0), (x1, lift, z1), (x0, lift, z1),
+            ))
+            cols.extend((color, color, color, color, color, color))
+
+        if not verts:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
+            return
+
+        if self.spatial_map_mesh is None:
+            self.spatial_map_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.spatial_map_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._spatial_map_visible = True
+        self._latest_spatial_map_cell_count = len(verts) // 6
+
+    def _yolo_3d_color_for_class(self, class_id: int):
+        if class_id == 1:
+            return (0.20, 0.72, 1.0)
+        if class_id in (2, 12, 14, 16):
+            return (0.20, 1.0, 0.70)
+        if class_id == 3:
+            return (0.95, 0.70, 0.42)
+        if class_id == 7:
+            return (1.0, 0.44, 0.02)
+        if class_id == 9:
+            return (1.0, 0.88, 0.08)
+        return YOLO_3D_BBOX_DEFAULT_COLOR
+
+    def _sensor_point_to_local(self, point: Tuple[float, float, float], lift: float = 0.0):
+        local_pose = self._sensor_depth_to_local_pose(
+            float(point[0]),
+            float(point[1]),
+            float(point[2]),
+            lateral_offset=0.0,
+        )
+        local_pose[1] += lift
+        return tuple(local_pose)
+
+    def _yolo_box_corners(self, box: Dict[str, object]):
+        corners = box.get("corners_3d_m", [])
+        if isinstance(corners, list) and len(corners) >= 8:
+            return corners[:8]
+
+        dims = box.get("dimensions_m", {})
+        if not isinstance(dims, dict):
+            dims = {}
+        class_id = int(box.get("class_id", 255))
+        height = _safe_float(dims.get("height"), 0.0)
+        if not self._valid_dimension(height):
+            height = self._default_height_for_class(class_id)
+
+        footprint = box.get("footprint_m", [])
+        if isinstance(footprint, list) and len(footprint) >= 4:
+            bottom = [(float(p[0]), float(p[1]), 0.0) for p in footprint[:4]]
+            top = [(p[0], p[1], height) for p in bottom]
+            return bottom + top
+
+        center_ground = box.get("center_ground_m", [])
+        center_3d = box.get("center_3d_m", [])
+        if isinstance(center_ground, list) and center_ground:
+            center_forward = float(center_ground[0][0])
+            center_left = float(center_ground[0][1])
+            bottom_up = 0.0
+        elif isinstance(center_3d, list) and center_3d:
+            center_forward = float(center_3d[0][0])
+            center_left = float(center_3d[0][1])
+            bottom_up = max(0.0, float(center_3d[0][2]) - (height * 0.5))
+        else:
+            return []
+
+        length = _safe_float(dims.get("length"), 0.0)
+        width = _safe_float(dims.get("width"), 0.0)
+        if not self._valid_dimension(length) or not self._valid_dimension(width):
+            return []
+
+        yaw = _safe_float(box.get("yaw_rad"), 0.0)
+        length_axis = (math.cos(yaw), math.sin(yaw))
+        width_axis = (-math.sin(yaw), math.cos(yaw))
+        half_length = length * 0.5
+        half_width = width * 0.5
+        ground = []
+        for length_sign, width_sign in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
+            forward = (
+                center_forward
+                + length_axis[0] * half_length * length_sign
+                + width_axis[0] * half_width * width_sign
+            )
+            left = (
+                center_left
+                + length_axis[1] * half_length * length_sign
+                + width_axis[1] * half_width * width_sign
+            )
+            ground.append((forward, left, bottom_up))
+        return ground + [(p[0], p[1], p[2] + height) for p in ground]
+
+    def _sync_yolo_3d_boxes(self, boxes: List[Dict[str, object]]):
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+        rendered_count = 0
+        max_range_sq = SPATIAL_MAP_MAX_RANGE_M * SPATIAL_MAP_MAX_RANGE_M
+
+        for box in boxes:
+            corners = self._yolo_box_corners(box)
+            if len(corners) < 8:
+                continue
+            local_corners = []
+            for corner in corners[:8]:
+                if len(corner) < 3:
+                    local_corners = []
+                    break
+                forward = float(corner[0])
+                left = float(corner[1])
+                up = float(corner[2])
+                if not all(math.isfinite(v) and abs(v) < 9000.0 for v in (forward, left, up)):
+                    local_corners = []
+                    break
+                if forward * forward + left * left > max_range_sq:
+                    local_corners = []
+                    break
+                local_corners.append(self._sensor_point_to_local((forward, left, up), YOLO_3D_BBOX_RENDER_LIFT_M))
+            if len(local_corners) < 8:
+                continue
+
+            color = self._yolo_3d_color_for_class(int(box.get("class_id", 255)))
+            if not bool(box.get("valid_obb", True)):
+                color = (1.0, 0.25, 0.85)
+            for start_idx, end_idx in edges:
+                verts.append(local_corners[start_idx])
+                verts.append(local_corners[end_idx])
+                cols.append(color)
+                cols.append(color)
+            rendered_count += 1
+
+        if not verts:
+            self._yolo_3d_bbox_visible = False
+            self._latest_yolo_3d_bbox_count = 0
+            return
+
+        if self.yolo_3d_bbox_mesh is None:
+            self.yolo_3d_bbox_mesh = Mesh([], [], None, None, gl.GL_LINES, mat4_identity())
+        self.renderer.update_color_mesh(self.yolo_3d_bbox_mesh, verts, cols, gl.GL_LINES)
+        self._yolo_3d_bbox_visible = True
+        self._latest_yolo_3d_bbox_count = rendered_count
+
+    def _sync_reference_path(self, poses: List[Tuple[float, ...]]):
+        enu_poses = []
+        for pose in poses:
+            if len(pose) < 2:
+                continue
+            east = float(pose[0])
+            north = float(pose[1])
+            if not (math.isfinite(east) and math.isfinite(north)):
+                continue
+            if abs(east) >= 9000.0 or abs(north) >= 9000.0:
+                continue
+            yaw = float(pose[3]) if len(pose) >= 4 else float("nan")
+            enu_poses.append((east, north, yaw))
+
+        if not enu_poses:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = 0
+            return
+
+        origin_east, origin_north, origin_yaw = enu_poses[0]
+        if not math.isfinite(origin_yaw) and len(enu_poses) >= 2:
+            next_east, next_north, _next_yaw = enu_poses[1]
+            origin_yaw = math.atan2(next_north - origin_north, next_east - origin_east)
+        if not math.isfinite(origin_yaw):
+            origin_yaw = 0.0
+
+        car_T = mat4_translate(*self.ego.pos)
+        car_R = mat4_rotate_y(self.ego.yaw)
+        next_anchor_model = mat4_mul(car_T, car_R)
+
+        forward_east = math.cos(origin_yaw)
+        forward_north = math.sin(origin_yaw)
+        right_east = math.sin(origin_yaw)
+        right_north = -math.cos(origin_yaw)
+
+        path_points = []
+        for east, north, _yaw in enu_poses:
+            delta_east = east - origin_east
+            delta_north = north - origin_north
+            # Convert from ROS ENU into the car-start frame using the message's
+            # first orientation. ENU yaw is about +Z; the renderer's car-forward
+            # axis is local -Z after anchoring by the captured start transform.
+            local_x = (delta_east * right_east) + (delta_north * right_north)
+            local_forward = (delta_east * forward_east) + (delta_north * forward_north)
+            path_points.append((local_x, REFERENCE_PATH_RENDER_LIFT_M, -local_forward))
+
+        if len(path_points) < 2:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = len(path_points)
+            return
+
+        render_points = smooth_polyline(path_points, passes=1)
+        verts, cols = make_polyline_ribbon(
+            render_points,
+            width=REFERENCE_PATH_WIDTH_M,
+            color=REFERENCE_PATH_COLOR,
+            edge_alpha=REFERENCE_PATH_EDGE_ALPHA,
+        )
+        if not verts:
+            self._reference_path_visible = False
+            self._latest_reference_path_count = 0
+            return
+
+        if self.reference_path_mesh is None:
+            self.reference_path_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self._reference_path_anchor_model = next_anchor_model
+        self.renderer.update_color_mesh(self.reference_path_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._reference_path_visible = True
+        self._latest_reference_path_count = len(path_points)
+
+    def _sync_ground_truth_lanes(self, vehicle_pose, lanes: List[Dict[str, object]]):
+        if vehicle_pose is None:
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        origin_east = float(vehicle_pose[0])
+        origin_north = float(vehicle_pose[1])
+        origin_yaw = float(vehicle_pose[3])
+        if not all(math.isfinite(v) for v in (origin_east, origin_north, origin_yaw)):
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        forward_east = math.cos(origin_yaw)
+        forward_north = math.sin(origin_yaw)
+        right_east = math.sin(origin_yaw)
+        right_north = -math.cos(origin_yaw)
+
+        verts: List[Tuple[float, float, float]] = []
+        cols: List[Tuple[float, float, float]] = []
+        lane_count = 0
+        for lane in lanes:
+            local_points = []
+            for point in lane.get("points", []):
+                if len(point) < 2:
+                    continue
+                east = float(point[0])
+                north = float(point[1])
+                if not (math.isfinite(east) and math.isfinite(north)):
+                    continue
+                delta_east = east - origin_east
+                delta_north = north - origin_north
+                local_x = (delta_east * right_east) + (delta_north * right_north)
+                local_forward = (delta_east * forward_east) + (delta_north * forward_north)
+                local_points.append((local_x, GROUND_TRUTH_LANE_RENDER_LIFT_M, -local_forward))
+
+            if len(local_points) < 2:
+                continue
+            lane_verts, lane_cols = make_polyline_ribbon(
+                smooth_polyline(local_points, passes=1),
+                width=GROUND_TRUTH_LANE_WIDTH_M,
+                color=GROUND_TRUTH_LANE_COLOR,
+            )
+            verts.extend(lane_verts)
+            cols.extend(lane_cols)
+            lane_count += 1
+
+        if not verts:
+            self._ground_truth_lane_visible = False
+            self._latest_ground_truth_lane_count = 0
+            return
+
+        if self.ground_truth_lane_mesh is None:
+            self.ground_truth_lane_mesh = Mesh([], [], None, None, gl.GL_TRIANGLES, mat4_identity())
+        self.renderer.update_color_mesh(self.ground_truth_lane_mesh, verts, cols, gl.GL_TRIANGLES)
+        self._ground_truth_lane_visible = True
+        self._latest_ground_truth_lane_count = lane_count
+
     def _make_mesh_actor(self, mesh: Mesh):
         return MovingCharacter(clone_mesh(mesh), 0.0, 0.0, 0.0)
 
@@ -2307,7 +3876,8 @@ class AVHMI(pyglet.window.Window):
             return
         if isinstance(actor, StreetSign):
             self.renderer.warm_mesh(actor.pole_mesh)
-            self.renderer.warm_mesh(actor.panel_mesh)
+            for mesh in actor.panel_meshes:
+                self.renderer.warm_mesh(mesh)
             return
         if isinstance(actor, TrafficLight):
             self.renderer.warm_mesh(actor.mesh)
@@ -2318,16 +3888,61 @@ class AVHMI(pyglet.window.Window):
         if hasattr(actor, "mesh"):
             self.renderer.warm_mesh(actor.mesh)
 
+    def _queue_instanced_mesh(self, mesh: Mesh, instance_groups) -> bool:
+        key = self.renderer.instance_batch_key(mesh)
+        if key is None:
+            return False
+        template_mesh, models = instance_groups.setdefault(key, (mesh, []))
+        models.append(list(mesh.model))
+        return True
+
+    def _draw_detected_entities(self, pv, car_M):
+        instance_groups = {}
+
+        for entity in self.detected_entities.values():
+            entity.apply_anchor(car_M)
+            actor = entity.actor
+            if actor is None:
+                continue
+
+            if isinstance(actor, StreetSign):
+                self.renderer.draw_mesh(actor.pole_mesh, pv)
+                for mesh in actor.panel_meshes:
+                    self.renderer.draw_mesh(mesh, pv)
+                continue
+
+            if isinstance(actor, TrafficLight):
+                self.renderer.draw_mesh(actor.mesh, pv)
+                continue
+
+            mesh = actor if isinstance(actor, Mesh) else getattr(actor, "mesh", None)
+            if mesh is None:
+                continue
+            if not self._queue_instanced_mesh(mesh, instance_groups):
+                self.renderer.draw_mesh(mesh, pv)
+
+        for _key, (mesh, models) in instance_groups.items():
+            self.renderer.draw_mesh_instances(mesh, pv, models)
+
     def _actor_key_for_detection(self, detection: Dict[str, float]):
         obj_class = int(detection["obj_class"])
         custom = int(detection.get("custom_classification", 0))
         if obj_class == 6:
-            if custom == 5:
-                return (obj_class, "stop")
-            if custom == 9:
-                return (obj_class, "yield")
-            return (obj_class, "speed")
+            return (obj_class, self._sign_kind_for_custom_classification(custom))
         return (obj_class,)
+
+    def _sign_kind_for_custom_classification(self, custom: int) -> str:
+        return {
+            4: "speed",
+            5: "stop",
+            6: "no_right",
+            7: "no_left",
+            8: "do_not_enter",
+            9: "one_way",
+            10: "pedestrian",
+            11: "railroad",
+            15: "yield",
+        }.get(int(custom), "unknown")
 
     def _build_fallback_actor(self, obj_class: int, detection: Dict[str, float]):
         height = float(detection.get("height", 0.0))
@@ -2350,6 +3965,8 @@ class AVHMI(pyglet.window.Window):
             14: (0.8, 0.2, 0.2),
             15: (0.55, 0.55, 0.55),
             16: (0.8, 0.7, 0.6),
+            18: (0.72, 0.72, 0.68),
+            19: (0.82, 0.58, 0.16),
         }
         v, c = make_box_triangles(width, height, depth, colors.get(obj_class, (0.7, 0.7, 0.7)))
         mesh = Mesh(v, c, None, None, gl.GL_TRIANGLES, mat4_identity())
@@ -2368,18 +3985,16 @@ class AVHMI(pyglet.window.Window):
         if obj_class == 4:
             return MovingBarricade(0.0, 0.0, 0.0)
         if obj_class == 5:
-            return TrafficLight(0.0, 0.0, 0.0)
+            return TrafficLight(0.0, 0.0, 0.0, state=custom)
         if obj_class == 6:
-            sign_kind = "speed"
-            if custom == 5:
-                sign_kind = "stop"
-            elif custom == 9:
-                sign_kind = "yield"
-            return StreetSign(sign_kind, 0.0, 0.0, 0.0, yaw=math.pi)
+            sign_kind = self._sign_kind_for_custom_classification(custom)
+            return StreetSign(sign_kind, 0.0, 0.0, 0.0)
         if obj_class == 7 and "barrel" in self.detected_mesh_templates:
             return self._make_mesh_actor(self.detected_mesh_templates["barrel"])
         if obj_class == 9 and "cone" in self.detected_mesh_templates:
             return self._make_mesh_actor(self.detected_mesh_templates["cone"])
+        if obj_class == 18:
+            return Barrier(0.0, 0.0, 0.0)
         return self._build_fallback_actor(obj_class, detection)
 
     def _sync_detected_entities(self, detections: List[Dict[str, float]]):
@@ -2466,6 +4081,11 @@ class AVHMI(pyglet.window.Window):
             entity.apply_lane_consensus_yaw(consensus_yaw)
 
     def _estimate_ego_motion_local(self, detections: List[Dict[str, float]], detection_dt: Optional[float], ego_delta_yaw: float):
+        gps_motion = self._gps_ego_motion_local(detection_dt)
+        if gps_motion is not None:
+            self._ego_motion_local_estimate = list(gps_motion)
+            return list(self._ego_motion_local_estimate)
+
         motion_samples_x = []
         motion_samples_z = []
 
@@ -2509,22 +4129,6 @@ class AVHMI(pyglet.window.Window):
 
         return list(self._ego_motion_local_estimate)
 
-    # Input
-    def on_mouse_press(self, x, y, button, modifiers):
-        if button == mouse.LEFT:
-            self.mouse_captured = not self.mouse_captured
-            self.set_exclusive_mouse(self.mouse_captured)
-
-    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
-        if self.mouse_captured:
-            self.cam_yawoff -= dx * 0.0022   # inverted yaw
-            self.cam_pitch   = clamp(self.cam_pitch - dy*0.0022, math.radians(-5), math.radians(80))
-
-    def on_mouse_motion(self, x, y, dx, dy):
-        if self.mouse_captured:
-            self.cam_yawoff -= dx * 0.0022
-            self.cam_pitch   = clamp(self.cam_pitch - dy*0.0022, math.radians(-5), math.radians(80))
-
     def on_resize(self, width, height):
         self._projection_dirty = True
         return super().on_resize(width, height)
@@ -2535,7 +4139,136 @@ class AVHMI(pyglet.window.Window):
             self._projection_dirty = False
         return self._projection_matrix
 
+    def _project_world_to_screen(self, pv, world_point):
+        clip_x, clip_y, clip_z, clip_w = mat4_transform_point(pv, world_point[0], world_point[1], world_point[2])
+        if clip_w <= 1e-6:
+            return None
+        ndc_x = clip_x / clip_w
+        ndc_y = clip_y / clip_w
+        ndc_z = clip_z / clip_w
+        if ndc_x < -1.15 or ndc_x > 1.15 or ndc_y < -1.15 or ndc_y > 1.15 or ndc_z < -1.0 or ndc_z > 1.0:
+            return None
+        return ((ndc_x * 0.5 + 0.5) * self.width, (ndc_y * 0.5 + 0.5) * self.height)
+
+    def _draw_coordinate_labels(self, pv, car_M, camera_world):
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        for entity in self.detected_entities.values():
+            if not entity._pose_initialized:
+                continue
+            world_point = entity.label_world_point(car_M, self._default_height_for_class(entity.obj_class))
+            screen_point = self._project_world_to_screen(pv, world_point)
+            if screen_point is None:
+                continue
+
+            wx, wy, wz = world_point
+            cx, cy, cz = camera_world
+            camera_distance = math.sqrt((wx - cx) ** 2 + (wy - cy) ** 2 + (wz - cz) ** 2)
+            font_size = int(clamp(15.0 - (camera_distance * 0.16), 5.0, 12.0))
+            alpha = int(clamp(260.0 - (camera_distance * 2.0), 95.0, 235.0))
+
+            self.coord_label.text = entity.label_text()
+            self.coord_label.font_size = font_size
+            self.coord_label.x = screen_point[0]
+            self.coord_label.y = screen_point[1]
+            self.coord_label.color = (235, 245, 255, alpha)
+            self.coord_label.draw()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+    def _draw_translucent_mesh(self, mesh: Mesh, pv, alpha: float):
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDepthMask(gl.GL_FALSE)
+        try:
+            self.renderer.draw_mesh(mesh, pv, alpha=alpha)
+        finally:
+            gl.glDepthMask(gl.GL_TRUE)
+            gl.glDisable(gl.GL_BLEND)
+
+    def _gps_velocity_is_fresh(self, now: Optional[float] = None):
+        if self._last_gps_velocity_stamp <= 0.0:
+            return False
+        if now is None:
+            now = time.perf_counter()
+        return now - self._last_gps_velocity_stamp <= GPS_VELOCITY_FRESHNESS_SEC
+
+    def _gps_heading_is_fresh(self, now: Optional[float] = None):
+        if self._last_gps_heading_stamp <= 0.0 or self._gps_heading_rad is None:
+            return False
+        if now is None:
+            now = time.perf_counter()
+        return now - self._last_gps_heading_stamp <= GPS_HEADING_FRESHNESS_SEC
+
+    def _gps_motion_yaw(self, now: Optional[float] = None):
+        if self._gps_heading_is_fresh(now):
+            return self._gps_heading_rad
+        if self._gps_track_rad is not None:
+            return self._gps_track_rad
+        return self.ego.yaw
+
+    def _sync_gps_velocity(self, velocity: Optional[Dict[str, float]]):
+        if velocity is None:
+            return
+
+        speed = float(velocity.get("hor_speed", 0.0))
+        track_deg = float(velocity.get("trk_gnd", float("nan")))
+        if not math.isfinite(speed):
+            return
+        speed = max(0.0, abs(speed))
+
+        track_rad = math.radians(track_deg % 360.0) if math.isfinite(track_deg) else None
+        self._gps_speed_mps = speed
+        self._gps_track_rad = track_rad
+        motion_yaw = self._gps_motion_yaw()
+        self._gps_world_velocity_mps = [
+            speed * math.sin(motion_yaw),
+            0.0,
+            -speed * math.cos(motion_yaw),
+        ]
+        self._ego_speed_mps_estimate = speed
+        self._ego_forward_speed_mps_estimate = speed
+        self._ego_speed_mph_history.append(speed * MPS_TO_MPH)
+        if len(self._ego_speed_mph_history) > SPEED_ROLLING_WINDOW:
+            self._ego_speed_mph_history.pop(0)
+
+    def _sync_gps_heading(self, heading: Optional[Dict[str, float]]):
+        if heading is None or not bool(heading.get("available", False)):
+            self._gps_heading_rad = None
+            return
+
+        azimuth = float(heading.get("azimuth", float("nan")))
+        if not math.isfinite(azimuth):
+            self._gps_heading_rad = None
+            return
+
+        self._gps_heading_rad = math.radians(azimuth % 360.0)
+
+    def _gps_ego_motion_local(self, dt: Optional[float]):
+        if dt is None or not math.isfinite(dt) or dt <= 0.0:
+            return None
+        if not self._gps_velocity_is_fresh():
+            return None
+
+        return [0.0, 0.0, -self._gps_speed_mps * dt]
+
+    def _apply_gps_ego_motion(self, dt: float):
+        if dt <= 0.0:
+            return
+
+        self.ego.v = self._gps_speed_mps
+        motion_yaw = self._gps_motion_yaw()
+        self.ego.yaw = lerp_angle(self.ego.yaw, motion_yaw, clamp(dt * 8.0, 0.0, 1.0))
+        self._gps_world_velocity_mps = [
+            self._gps_speed_mps * math.sin(self.ego.yaw),
+            0.0,
+            -self._gps_speed_mps * math.cos(self.ego.yaw),
+        ]
+        self.ego.pos[0] += self._gps_world_velocity_mps[0] * dt
+        self.ego.pos[2] += self._gps_world_velocity_mps[2] * dt
+        self.ego.mesh.model = mat4_mul(mat4_translate(*self.ego.pos), mat4_rotate_y(self.ego.yaw))
+
     def _current_ground_speed_mps(self):
+        if self._gps_velocity_is_fresh():
+            return self._gps_speed_mps
         if self._last_detection_stamp > 0.0:
             age = time.perf_counter() - self._last_detection_stamp
             if age <= GROUND_SPEED_FRESHNESS_SEC:
@@ -2552,83 +4285,244 @@ class AVHMI(pyglet.window.Window):
         self.last_time = now
         self._update_frame_index += 1
 
-        self.perception_bridge.spin_once()
-        detection_stamp, detections = self.perception_bridge.latest_object_snapshot()
+        with self.profiler.section("ros_ingest"):
+            detection_stamp, detections = self.perception_bridge.latest_object_snapshot()
+            lane_stamp, lanes = self.perception_bridge.latest_lane_snapshot()
+            stopbar_stamp, stopbar_depth = self.perception_bridge.latest_stopbar_snapshot()
+            polygon_stamp, driveable_polygon = self.perception_bridge.latest_driveable_polygon_snapshot()
+            spatial_map_stamp, spatial_map_cell_size, spatial_map_points = (
+                self.perception_bridge.latest_spatial_map_snapshot()
+            )
+            reference_path_stamp, reference_path = self.perception_bridge.latest_reference_path_snapshot()
+            ground_truth_lane_stamp, ground_truth_vehicle_pose, ground_truth_lanes = (
+                self.perception_bridge.latest_ground_truth_lane_snapshot()
+            )
+            gps_velocity_stamp, gps_velocity = self.perception_bridge.latest_gps_velocity_snapshot()
+            gps_heading_stamp, gps_heading = self.perception_bridge.latest_gps_heading_snapshot()
+            yolo_3d_bbox_stamp, yolo_3d_boxes = self.perception_bridge.latest_yolo_3d_bbox_snapshot()
+
+        if gps_heading_stamp > self._last_gps_heading_stamp:
+            self._sync_gps_heading(gps_heading)
+            self._last_gps_heading_stamp = gps_heading_stamp
+
+        if gps_velocity_stamp > self._last_gps_velocity_stamp:
+            self._sync_gps_velocity(gps_velocity)
+            self._last_gps_velocity_stamp = gps_velocity_stamp
+
         if detection_stamp > self._last_detection_stamp:
-            self._sync_detected_entities(detections)
+            with self.profiler.section("sync_objects"):
+                self._sync_detected_entities(detections)
             self._last_detection_stamp = detection_stamp
 
-        lane_stamp, lanes = self.perception_bridge.latest_lane_snapshot()
-        if lane_stamp > self._last_lane_stamp:
-            self._sync_lane_lines(lanes)
-            self._last_lane_stamp = lane_stamp
+        if lane_stamp > self._pending_lane_stamp:
+            self._pending_lane_stamp = lane_stamp
+            self._pending_lanes = lanes
+        if (
+            self._pending_lane_stamp > self._last_lane_stamp
+            and now - self._last_lane_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_lanes"):
+                self._sync_lane_lines(self._pending_lanes)
+            self._last_lane_stamp = self._pending_lane_stamp
+            self._last_lane_geometry_sync_time = now
 
-        throttle  = 1.0 if self.keys[key.W] else 0.0
-        brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
-        steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
-        self.brake_on = brake > 0.1
+        if stopbar_stamp > self._last_stopbar_stamp:
+            with self.profiler.section("mesh_stopbar"):
+                self._sync_stopbar(stopbar_depth)
+            self._last_stopbar_stamp = stopbar_stamp
 
-        self.ego.update(dt, throttle, steer_cmd, brake)
-        ground_speed_mps = self._current_ground_speed_mps()
-        for w in self.wheels:
-            r = max(1e-6, w['radius'])
-            self._wheel_roll += (ground_speed_mps / r) * dt
-        self._stream_grid()
+        if self.stopbar_mesh is not None and self._last_stopbar_stamp > 0.0:
+            if time.perf_counter() - self._last_stopbar_stamp > STOPBAR_FRESHNESS_SEC:
+                self.stopbar_distance = None
 
-        if getattr(self, 'show_obstacles', False):
-            for o in self.obstacles:
-                o.update(dt)
-        # update characters
-        for ch in self.characters:
-            ch.update(dt)
-        # update street signs
-        for ss in self.street_signs:
-            ss.update(dt)
-        # update traffic light
-        if self.traffic_light is not None:
-            self.traffic_light.update(dt)
+        if polygon_stamp > self._pending_driveable_polygon_stamp:
+            self._pending_driveable_polygon_stamp = polygon_stamp
+            self._pending_driveable_polygon = driveable_polygon
+        if (
+            self._pending_driveable_polygon_stamp > self._last_driveable_polygon_stamp
+            and now - self._last_driveable_polygon_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_polygon"):
+                self._sync_driveable_polygon(self._pending_driveable_polygon)
+            self._last_driveable_polygon_stamp = self._pending_driveable_polygon_stamp
+            self._last_driveable_polygon_geometry_sync_time = now
+
+        if self.driveable_polygon_mesh is not None and self._last_driveable_polygon_stamp > 0.0:
+            if time.perf_counter() - self._last_driveable_polygon_stamp > DRIVEABLE_POLYGON_FRESHNESS_SEC:
+                self._driveable_polygon_visible = False
+
+        if self.show_spatial_map:
+            if spatial_map_stamp > self._pending_spatial_map_stamp:
+                self._pending_spatial_map_stamp = spatial_map_stamp
+                self._pending_spatial_map_cell_size = spatial_map_cell_size
+                self._pending_spatial_map_points = spatial_map_points
+            if (
+                self._pending_spatial_map_stamp > self._last_spatial_map_stamp
+                and now - self._last_spatial_map_geometry_sync_time >= self._perception_geometry_min_interval
+            ):
+                with self.profiler.section("mesh_spatial_map"):
+                    self._sync_spatial_map(
+                        self._pending_spatial_map_cell_size,
+                        self._pending_spatial_map_points,
+                    )
+                self._last_spatial_map_stamp = self._pending_spatial_map_stamp
+                self._last_spatial_map_geometry_sync_time = now
+
+            if self.spatial_map_mesh is not None and self._last_spatial_map_stamp > 0.0:
+                if time.perf_counter() - self._last_spatial_map_stamp > SPATIAL_MAP_FRESHNESS_SEC:
+                    self._spatial_map_visible = False
+        else:
+            self._spatial_map_visible = False
+            self._latest_spatial_map_cell_count = 0
+
+        if self.show_yolo_3d_boxes:
+            if yolo_3d_bbox_stamp > self._pending_yolo_3d_bbox_stamp:
+                self._pending_yolo_3d_bbox_stamp = yolo_3d_bbox_stamp
+                self._pending_yolo_3d_boxes = yolo_3d_boxes
+            if (
+                self._pending_yolo_3d_bbox_stamp > self._last_yolo_3d_bbox_stamp
+                and now - self._last_yolo_3d_bbox_geometry_sync_time >= self._perception_geometry_min_interval
+            ):
+                with self.profiler.section("mesh_yolo_3d_bbox"):
+                    self._sync_yolo_3d_boxes(self._pending_yolo_3d_boxes)
+                self._last_yolo_3d_bbox_stamp = self._pending_yolo_3d_bbox_stamp
+                self._last_yolo_3d_bbox_geometry_sync_time = now
+
+            if self.yolo_3d_bbox_mesh is not None and self._last_yolo_3d_bbox_stamp > 0.0:
+                if time.perf_counter() - self._last_yolo_3d_bbox_stamp > YOLO_3D_BBOX_FRESHNESS_SEC:
+                    self._yolo_3d_bbox_visible = False
+                    self._latest_yolo_3d_bbox_count = 0
+        else:
+            self._yolo_3d_bbox_visible = False
+            self._latest_yolo_3d_bbox_count = 0
+
+        if reference_path_stamp > self._pending_reference_path_stamp:
+            self._pending_reference_path_stamp = reference_path_stamp
+            self._pending_reference_path = reference_path
+        if (
+            self._pending_reference_path_stamp > self._last_reference_path_stamp
+            and now - self._last_reference_path_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_reference_path"):
+                self._sync_reference_path(self._pending_reference_path)
+            self._last_reference_path_stamp = self._pending_reference_path_stamp
+            self._last_reference_path_geometry_sync_time = now
+
+        if self.reference_path_mesh is not None and self._last_reference_path_stamp > 0.0:
+            if time.perf_counter() - self._last_reference_path_stamp > REFERENCE_PATH_FRESHNESS_SEC:
+                self._reference_path_visible = False
+
+        if ground_truth_lane_stamp > self._pending_ground_truth_lane_stamp:
+            self._pending_ground_truth_lane_stamp = ground_truth_lane_stamp
+            self._pending_ground_truth_vehicle_pose = ground_truth_vehicle_pose
+            self._pending_ground_truth_lanes = ground_truth_lanes
+        if (
+            self._pending_ground_truth_lane_stamp > self._last_ground_truth_lane_stamp
+            and now - self._last_ground_truth_lane_geometry_sync_time >= self._perception_geometry_min_interval
+        ):
+            with self.profiler.section("mesh_gt_lanes"):
+                self._sync_ground_truth_lanes(
+                    self._pending_ground_truth_vehicle_pose,
+                    self._pending_ground_truth_lanes,
+                )
+            self._last_ground_truth_lane_stamp = self._pending_ground_truth_lane_stamp
+            self._last_ground_truth_lane_geometry_sync_time = now
+
+        if self.ground_truth_lane_mesh is not None and self._last_ground_truth_lane_stamp > 0.0:
+            if time.perf_counter() - self._last_ground_truth_lane_stamp > GROUND_TRUTH_LANE_FRESHNESS_SEC:
+                self._ground_truth_lane_visible = False
+
+        with self.profiler.section("simulation"):
+            throttle  = 1.0 if self.keys[key.W] else 0.0
+            brake     = 1.0 if (self.keys[key.S] or self.keys[key.SPACE]) else 0.0
+            steer_cmd = (1.0 if self.keys[key.D] else 0.0) - (1.0 if self.keys[key.A] else 0.0)
+            self.brake_on = brake > 0.1
+
+            if self._gps_velocity_is_fresh(now):
+                self._apply_gps_ego_motion(dt)
+            else:
+                self.ego.update(dt, throttle, steer_cmd, brake)
+            ground_speed_mps = self._current_ground_speed_mps()
+            for w in self.wheels:
+                r = max(1e-6, w['radius'])
+                self._wheel_roll += (ground_speed_mps / r) * dt
+            self._stream_grid()
+
+            if getattr(self, 'show_obstacles', False):
+                for o in self.obstacles:
+                    o.update(dt)
+            # update characters
+            for ch in self.characters:
+                ch.update(dt)
+            # update street signs
+            for ss in self.street_signs:
+                ss.update(dt)
+            # update traffic light
+            if self.traffic_light is not None:
+                self.traffic_light.update(dt)
 
 
 
     # Draw
     def on_draw(self):
+        draw_start = time.perf_counter()
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         self.renderer.begin_frame()
 
         proj = self._projection()
 
-        # Camera mount point
-        cam_mount_local_x, cam_mount_local_y, cam_mount_local_z = self.camera_origin_local
-        
-        # Transform camera mount to world space based on vehicle rotation
-        c = math.cos(self.ego.yaw)
-        s = math.sin(self.ego.yaw)
-        cam_mount_world_x = self.ego.pos[0] + (c * cam_mount_local_x - s * cam_mount_local_z)
-        cam_mount_world_y = self.ego.pos[1] + cam_mount_local_y
-        cam_mount_world_z = self.ego.pos[2] + (s * cam_mount_local_x + c * cam_mount_local_z)
-        
-        # Camera orbits around the windshield mount point
-        tx, ty, tz = cam_mount_world_x, cam_mount_world_y, cam_mount_world_z
-        yaw = self.cam_yawoff
-        cx = tx - math.cos(yaw) * self.cam_dist
-        cy = ty + self.cam_height * math.sin(self.cam_pitch)
-        cz = tz + math.sin(yaw) * self.cam_dist
+        forward_x = math.sin(self.ego.yaw)
+        forward_z = -math.cos(self.ego.yaw)
+        tx = self.ego.pos[0] + (forward_x * self.chase_cam_lookahead)
+        ty = self.ego.pos[1] + self.chase_cam_target_height
+        tz = self.ego.pos[2] + (forward_z * self.chase_cam_lookahead)
+        cx = self.ego.pos[0] - (forward_x * self.chase_cam_dist)
+        cy = self.ego.pos[1] + self.chase_cam_height
+        cz = self.ego.pos[2] - (forward_z * self.chase_cam_dist)
         view = look_at((cx, cy, cz), (tx, ty, tz), (0.0, 1.0, 0.0))
         pv = mat4_mul(proj, view)
 
-        # Draw world with streaming grid
-        for _key, model in self.grid_tiles.items():
-            self.grid_base.model = model
-            self.renderer.draw_mesh(self.grid_base, pv)
+        # Draw world with one batched streaming-grid mesh
+        self.renderer.draw_mesh(self.grid_mesh, pv)
 
         # Car model matrix once
         car_T = mat4_translate(*self.ego.pos)
         car_R = mat4_rotate_y(self.ego.yaw)
         car_M = mat4_mul(car_T, car_R)
 
+        if self.driveable_polygon_mesh is not None and self._driveable_polygon_visible:
+            self.driveable_polygon_mesh.model = car_M
+            self._draw_translucent_mesh(self.driveable_polygon_mesh, pv, alpha=0.34)
+
+        if self.show_spatial_map and self.spatial_map_mesh is not None and self._spatial_map_visible:
+            self.spatial_map_mesh.model = car_M
+            self._draw_translucent_mesh(self.spatial_map_mesh, pv, alpha=SPATIAL_MAP_RENDER_ALPHA)
+
+        if self.show_yolo_3d_boxes and self.yolo_3d_bbox_mesh is not None and self._yolo_3d_bbox_visible:
+            self.yolo_3d_bbox_mesh.model = car_M
+            gl.glLineWidth(YOLO_3D_BBOX_LINE_WIDTH_PX)
+            self.renderer.draw_mesh(self.yolo_3d_bbox_mesh, pv, alpha=1.0)
+            gl.glLineWidth(1.0)
+
+        if self.reference_path_mesh is not None and self._reference_path_visible:
+            self.reference_path_mesh.model = self._reference_path_anchor_model or mat4_identity()
+            self._draw_translucent_mesh(self.reference_path_mesh, pv, alpha=1.0)
+
+        if self.ground_truth_lane_mesh is not None and self._ground_truth_lane_visible:
+            self.ground_truth_lane_mesh.model = car_M
+            self._draw_translucent_mesh(
+                self.ground_truth_lane_mesh,
+                pv,
+                alpha=GROUND_TRUTH_LANE_RENDER_ALPHA,
+            )
+
         for ln in self.lane_meshes:
             ln.model = car_M
             self.renderer.draw_mesh(ln, pv)
+
+        if self.stopbar_mesh is not None and self.stopbar_distance is not None:
+            self.stopbar_mesh.model = car_M
+            self.renderer.draw_mesh(self.stopbar_mesh, pv)
 
         # Draw car
         if self.car_mesh:
@@ -2667,28 +4561,58 @@ class AVHMI(pyglet.window.Window):
         # Draw street signs
         for ss in self.street_signs:
             self.renderer.draw_mesh(ss.pole_mesh, pv)
-            self.renderer.draw_mesh(ss.panel_mesh, pv)
+            for mesh in ss.panel_meshes:
+                self.renderer.draw_mesh(mesh, pv)
 
         # Draw characters
         for ch in self.characters:
             self.renderer.draw_mesh(ch.mesh, pv)
 
-        for entity in self.detected_entities.values():
-            entity.apply_anchor(car_M)
-            entity.draw(self.renderer, pv)
+        self._draw_detected_entities(pv, car_M)
 
-        ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
-        self.hud.text = (
-            f"Sim Speed {self.ego.v:4.1f} m/s   "
-            f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
-            f"{ros_status}   "
-            f"Objects {len(self.detected_entities)}   "
-            f"Lanes {self._latest_lane_count}"
-        )
-        self.hud.draw()
+        if self.show_labels:
+            with self.profiler.section("labels"):
+                self._draw_coordinate_labels(pv, car_M, (cx, cy, cz))
+
+                ros_status = "ROS2 OK" if self.perception_bridge.enabled else "ROS2 OFF"
+                stopbar_status = f"Stopbar {self.stopbar_distance:4.1f} m" if self.stopbar_distance is not None else "Stopbar --"
+                som_status = (
+                    f"SOM {self._latest_spatial_map_cell_count}"
+                    if self._spatial_map_visible
+                    else "SOM --"
+                )
+                gps_status = (
+                    f"GPS {self._gps_speed_mps:4.1f} m/s"
+                    if self._gps_velocity_is_fresh()
+                    else "GPS --"
+                )
+                heading_status = (
+                    f"Az {math.degrees(self._gps_heading_rad):5.1f} deg"
+                    if self._gps_heading_is_fresh()
+                    else "Az --"
+                )
+                self.hud.text = (
+                    f"Sim Speed {self.ego.v:4.1f} m/s   "
+                    f"Yaw {math.degrees(self.ego.yaw):5.1f} deg   "
+                    f"{gps_status}   "
+                    f"{heading_status}   "
+                    f"{ros_status}   "
+                    f"Objects {len(self.detected_entities)}   "
+                    f"OBB {self._latest_yolo_3d_bbox_count}   "
+                    f"Lanes {self._latest_lane_count}   "
+                    f"GT {self._latest_ground_truth_lane_count}   "
+                    f"Path {self._latest_reference_path_count}   "
+                    f"{stopbar_status}   "
+                    f"{som_status}"
+                )
+                self.hud.draw()
         
         if hasattr(self, 'streaming'):
-            self.streaming.push_frame()
+            with self.profiler.section("streaming"):
+                self.streaming.push_frame()
+
+        self.profiler.add("draw", time.perf_counter() - draw_start)
+        self.profiler.frame()
 
     def on_close(self):
         self.perception_bridge.close()
@@ -2696,21 +4620,34 @@ class AVHMI(pyglet.window.Window):
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
+    stream_fps = read_int_env("WAUTOVANTAGE_STREAM_FPS", 30)
+    stream_queue_size = read_int_env("WAUTOVANTAGE_STREAM_QUEUE_SIZE", 1)
+    stream_keyframe_interval = read_int_env(
+        "WAUTOVANTAGE_STREAM_GOP",
+        1
+    )
+    stream_mode = read_str_env("WAUTOVANTAGE_STREAM_MODE", "mpegts").lower()
+    stream_host = read_str_env("WAUTOVANTAGE_STREAM_HOST", "127.0.0.1")
+    stream_port_default = 5000 if stream_mode == "mpegts" else 5004
+    stream_port = read_int_env("WAUTOVANTAGE_STREAM_PORT", stream_port_default)
     try:
         from streaming_integration import StreamingIntegration
         streaming = StreamingIntegration(
-            width=1280,
-            height=720,
-            fps=30,
-            rtp_host="127.0.0.1",
-            rtp_port=5004
+            width=640,
+            height=360,
+            fps=stream_fps,
+            rtp_host=stream_host,
+            rtp_port=stream_port,
+            queue_size=stream_queue_size,
+            keyframe_interval=stream_keyframe_interval,
+            stream_mode=stream_mode
         )
     except ImportError:
         print("Streaming module not available - running without streaming")
         streaming = None
     
     # Create and run the main window
-    window = AVHMI(1280, 720, 60)
+    window = AVHMI(640, 360, 60)
     
     if streaming:
         window.streaming = streaming

@@ -1,0 +1,8 @@
+<CycloneDDS>
+  <Domain>
+    <Tracing>
+      <Verbosity>finest</Verbosity>
+      <OutputFile>cyclonedds-%p.log</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>
